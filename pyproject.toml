@@ -1,0 +1,37 @@
+[tool.poetry]
+name = "minimax-m2-proxy"
+version = "0.1.0"
+description = "Dual-API proxy for MiniMax-M2 with OpenAI and Anthropic compatibility"
+authors = ["ser"]
+readme = "README.md"
+
+[tool.poetry.dependencies]
+python = "^3.11"
+fastapi = "^0.109.0"
+uvicorn = {extras = ["standard"], version = "^0.27.0"}
+httpx = "^0.26.0"
+pydantic = "^2.5.0"
+pydantic-settings = "^2.1.0"
+
+[tool.poetry.group.dev.dependencies]
+pytest = "^8.0.0"
+pytest-asyncio = "^0.23.0"
+pytest-cov = "^4.1.0"
+black = "^24.0.0"
+ruff = "^0.1.0"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.black]
+line-length = 100
+target-version = ['py311']
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
