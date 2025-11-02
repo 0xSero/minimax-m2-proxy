@@ -337,6 +337,8 @@ ENABLE_TOOL_TRANSLATION=true          # Parse tool calls
 # Logging
 LOG_LEVEL=INFO
 LOG_RAW_RESPONSES=false               # Debug: log raw TabbyAPI responses
+ENABLE_STREAMING_DEBUG=false          # Debug: trace streaming deltas and parser decisions
+STREAMING_DEBUG_PATH=proxy_stream.log # Optional file to persist streaming trace
 ```
 
 ## Chat Templates
@@ -439,6 +441,14 @@ sudo journalctl -u minimax-m2-proxy -f  # if using systemd
 2. **Verify raw output**: Set `LOG_RAW_RESPONSES=true` in `.env` and check logs
 3. **Test XML format**: Model should output `<minimax:tool_call>` with proper structure
 4. **Validate tools**: Ensure tool schemas are valid JSONSchema
+
+### Streaming think blocks look wrong
+
+1. Enable `ENABLE_STREAMING_DEBUG=true` and optionally set `STREAMING_DEBUG_PATH`.
+2. Reproduce the request – the proxy writes every Tabby SSE line (`tabby_sse`), parsed chunk (`tabby_chunk`), and parser decision (`emit_*`, `tool_event_*`).
+3. Inspect the trace to see whether Tabby ever sent `<think>`, whether the proxy synthesised a closing tag, and whether a tool delta dropped the function name.
+4. If Tabby never emits `<think>`, verify its chat template matches the [MiniMax template](https://huggingface.co/MiniMaxAI/MiniMax-M2/blob/main/chat_template.jinja) and that `--chat-template` is pointed at it.
+5. Share the trace when filing issues; it includes enough context to detect regressions the unit tests miss.
 
 ### Streaming is slow
 

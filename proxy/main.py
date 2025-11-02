@@ -21,6 +21,7 @@ from .models import (
 )
 from parsers.tools import ToolCallParser
 from parsers.streaming import SimpleStreamingParser
+from parsers.reasoning import ensure_think_wrapped
 from formatters.openai import OpenAIFormatter
 from formatters.anthropic import AnthropicFormatter
 
@@ -31,6 +32,19 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+stream_logger = logging.getLogger("minimax.streaming")
+
+if settings.enable_streaming_debug:
+    stream_logger.setLevel(logging.DEBUG)
+    if settings.streaming_debug_path:
+        # Avoid duplicate handlers when reload=True
+        if not any(isinstance(h, logging.FileHandler) and h.baseFilename == settings.streaming_debug_path for h in stream_logger.handlers):
+            handler = logging.FileHandler(settings.streaming_debug_path)
+            handler.setLevel(logging.DEBUG)
+            handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+            stream_logger.addHandler(handler)
+else:
+    stream_logger.setLevel(logging.INFO)
 
 # Global client instance
 tabby_client: TabbyClient = None
@@ -48,7 +62,12 @@ async def lifespan(app: FastAPI):
     logger.info(f"Starting MiniMax-M2 Proxy on {settings.host}:{settings.port}")
     logger.info(f"Backend TabbyAPI: {settings.tabby_url}")
 
-    tabby_client = TabbyClient(settings.tabby_url, settings.tabby_timeout)
+    tabby_client = TabbyClient(
+        settings.tabby_url,
+        settings.tabby_timeout,
+        log_stream_raw=settings.enable_streaming_debug,
+        stream_logger=stream_logger
+    )
 
     # Check backend health
     if await tabby_client.health_check():
@@ -123,15 +142,23 @@ async def complete_openai_response(request: OpenAIChatRequest) -> dict:
     if settings.log_raw_responses:
         logger.debug(f"Raw TabbyAPI response: {response}")
 
-    # Extract raw content
+    # Extract raw content (contains XML and <think> blocks)
     raw_content = response["choices"][0]["message"].get("content", "")
+    raw_content, _ = ensure_think_wrapped(raw_content)
 
-    # Parse tool calls if present
+    # Parse tool calls and preserve <think> blocks in content
     result = tool_parser.parse_tool_calls(raw_content, tools)
 
-    # Format response
+    content_payload = raw_content if not result["tools_called"] else result["content"]
+
+    if result["tools_called"] and content_payload is None:
+        stripped_content = tool_parser.extract_content_without_tools(raw_content)
+        if stripped_content and stripped_content.strip():
+            content_payload, _ = ensure_think_wrapped(stripped_content.rstrip())
+
+    # Format response with <think> blocks preserved in content
     return openai_formatter.format_complete_response(
-        content=result["content"] if result["tools_called"] else raw_content,
+        content=content_payload,
         tool_calls=result["tool_calls"] if result["tools_called"] else None,
         model=request.model
     )
@@ -148,9 +175,11 @@ async def stream_openai_response(request: OpenAIChatRequest) -> AsyncIterator[st
     if request.tools:
         tools = [tool.model_dump(exclude_none=True) for tool in request.tools]
 
-    # Initialize streaming parser
+    # Initialize streaming parser to preserve <think> blocks
     streaming_parser = SimpleStreamingParser()
     streaming_parser.set_tools(tools)
+    if settings.enable_streaming_debug:
+        streaming_parser.set_logger(stream_logger)
 
     try:
         # Stream from TabbyAPI
@@ -172,29 +201,37 @@ async def stream_openai_response(request: OpenAIChatRequest) -> AsyncIterator[st
                 content_delta = delta.get("content", "")
 
                 if content_delta:
-                    # Process with streaming parser
+                    # Process with streaming parser to extract tool calls and preserve <think> blocks
+                    # Note: Parser will handle prepending <think> tag when it detects </think>
                     parsed = streaming_parser.process_chunk(content_delta)
 
                     if parsed:
                         if parsed["type"] == "content":
-                            # Send content delta
-                            yield openai_formatter.format_streaming_chunk(delta=parsed["delta"])
+                            # Send content delta (includes <think> blocks)
+                            yield openai_formatter.format_streaming_chunk(delta=parsed["delta"], model=request.model)
 
                         elif parsed["type"] == "tool_calls":
-                            # Send content first if present
+                            # Send content first if present (includes <think> blocks)
                             if parsed.get("content"):
-                                yield openai_formatter.format_streaming_chunk(delta=parsed["content"])
+                                yield openai_formatter.format_streaming_chunk(delta=parsed["content"], model=request.model)
 
-                            # Send tool calls
-                            for tool_call in parsed["tool_calls"]:
-                                yield openai_formatter.format_streaming_chunk(tool_calls=[tool_call])
+                            # Send tool calls as compliant streaming deltas
+                            for idx, tool_call in enumerate(parsed["tool_calls"]):
+                                for tool_chunk in openai_formatter.format_tool_call_stream(tool_call, idx, model=request.model):
+                                    yield tool_chunk
 
                 # Check for finish
                 finish_reason = choice.get("finish_reason")
                 if finish_reason:
-                    yield openai_formatter.format_streaming_chunk(finish_reason=finish_reason)
+                    pending_tail = streaming_parser.flush_pending()
+                    if pending_tail:
+                        yield openai_formatter.format_streaming_chunk(delta=pending_tail, model=request.model)
+                    yield openai_formatter.format_streaming_chunk(finish_reason=finish_reason, model=request.model)
 
         # Send done
+        pending_tail = streaming_parser.flush_pending()
+        if pending_tail:
+            yield openai_formatter.format_streaming_chunk(delta=pending_tail, model=request.model)
         yield openai_formatter.format_streaming_done()
 
     except Exception as e:
@@ -258,13 +295,18 @@ async def complete_anthropic_response(request: AnthropicChatRequest) -> dict:
     if settings.log_raw_responses:
         logger.debug(f"Raw TabbyAPI response: {response}")
 
-    # Extract raw content
+    # Extract raw content (contains XML and <think> blocks)
     raw_content = response["choices"][0]["message"].get("content", "")
 
-    # Parse tool calls
+    # IMPORTANT: TabbyAPI doesn't include the opening <think> tag in completions
+    # because it's part of the generation prompt. We need to add it back.
+    if raw_content and "</think>" in raw_content and not raw_content.strip().startswith("<think>"):
+        raw_content = "<think>\n" + raw_content
+
+    # Parse tool calls and preserve <think> blocks
     result = tool_parser.parse_tool_calls(raw_content, tools)
 
-    # Format as Anthropic response
+    # Format as Anthropic response with <think> blocks preserved
     return anthropic_formatter.format_complete_response(
         content=result["content"] if result["tools_called"] else raw_content,
         tool_calls=result["tool_calls"] if result["tools_called"] else None,
@@ -286,7 +328,7 @@ async def stream_anthropic_response(request: AnthropicChatRequest) -> AsyncItera
     # Convert tools
     tools = anthropic_tools_to_openai(request.tools)
 
-    # Initialize streaming parser
+    # Initialize streaming parser to preserve <think> blocks
     streaming_parser = SimpleStreamingParser()
     streaming_parser.set_tools(tools)
 
@@ -317,7 +359,8 @@ async def stream_anthropic_response(request: AnthropicChatRequest) -> AsyncItera
                 content_delta = delta.get("content", "")
 
                 if content_delta:
-                    # Process with streaming parser
+                    # Process with streaming parser to preserve <think> blocks
+                    # Note: Parser will handle prepending <think> tag when it detects </think>
                     parsed = streaming_parser.process_chunk(content_delta)
 
                     if parsed:
@@ -327,7 +370,7 @@ async def stream_anthropic_response(request: AnthropicChatRequest) -> AsyncItera
                                 yield anthropic_formatter.format_content_block_start(content_block_index, "text")
                                 content_block_started = True
 
-                            # Send content delta
+                            # Send content delta (includes <think> blocks)
                             yield anthropic_formatter.format_content_block_delta(
                                 content_block_index,
                                 parsed["delta"]

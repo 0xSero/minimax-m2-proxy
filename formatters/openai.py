@@ -81,7 +81,18 @@ class OpenAIFormatter:
             delta_content["content"] = delta
 
         if tool_calls is not None:
-            delta_content["tool_calls"] = tool_calls
+            normalized_calls = []
+            for idx, call in enumerate(tool_calls):
+                call_entry = {}
+                for key, value in call.items():
+                    if key == "function" and isinstance(value, dict):
+                        call_entry[key] = dict(value)
+                    else:
+                        call_entry[key] = value
+                if "index" not in call_entry:
+                    call_entry["index"] = idx
+                normalized_calls.append(call_entry)
+            delta_content["tool_calls"] = normalized_calls
 
         chunk = {
             "id": f"chatcmpl-{uuid.uuid4().hex[:29]}",
@@ -97,6 +108,39 @@ class OpenAIFormatter:
         }
 
         return f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+
+    @staticmethod
+    def format_tool_call_stream(tool_call: Dict[str, Any], index: int, model: str = "minimax-m2") -> List[str]:
+        """Create streaming chunks for a single tool call following OpenAI spec."""
+        chunks: List[str] = []
+
+        call_id = tool_call.get("id")
+        call_type = tool_call.get("type")
+        function = tool_call.get("function", {})
+
+        # First chunk announces the tool call id/type. Include the function name
+        # immediately so downstream clients that validate the field as a string
+        # don't fail on an empty placeholder object.
+        id_delta: Dict[str, Any] = {"index": index, "function": {}}
+        if call_id is not None:
+            id_delta["id"] = call_id
+        if call_type is not None:
+            id_delta["type"] = call_type
+        if name := function.get("name"):
+            id_delta["function"]["name"] = name
+        else:
+            id_delta["function"]["name"] = ""
+        chunks.append(OpenAIFormatter.format_streaming_chunk(tool_calls=[id_delta], model=model))
+
+        # Second chunk carries the arguments payload
+        arguments = function.get("arguments")
+        if arguments:  # Only send if arguments is truthy
+            chunks.append(OpenAIFormatter.format_streaming_chunk(
+                tool_calls=[{"index": index, "function": {"arguments": arguments}}],
+                model=model
+            ))
+
+        return chunks
 
     @staticmethod
     def format_streaming_done() -> str:

@@ -8,6 +8,8 @@ import re
 import uuid
 from typing import Any, Dict, List, Optional
 
+from .reasoning import ensure_think_wrapped
+
 
 class ToolCall(Dict[str, Any]):
     """OpenAI-format tool call"""
@@ -171,12 +173,17 @@ class ToolCallParser:
                 "content": str  # Content without tool call blocks
             }
         """
+        # Normalise reasoning tags before any parsing so downstream helpers see
+        # balanced <think> blocks even though Tabby omits the opening tag.
+        normalized_text, _ = ensure_think_wrapped(text)
+        text = normalized_text
+
         # Quick check
         if self.tool_call_start_token not in text:
             return {
                 "tools_called": False,
                 "tool_calls": [],
-                "content": text
+                "content": normalized_text
             }
 
         try:
@@ -197,9 +204,13 @@ class ToolCallParser:
                     "content": text
                 }
 
-            # Extract content before first tool call
-            first_tool_idx = text.find(self.tool_call_start_token)
-            content = text[:first_tool_idx].strip() if first_tool_idx > 0 else None
+            # Extract content without tool call blocks so reasoning is preserved
+            content = self.extract_content_without_tools(text)
+            if content is not None:
+                if content.strip() == "":
+                    content = None
+                else:
+                    content, _ = ensure_think_wrapped(content.rstrip())
 
             return {
                 "tools_called": True,
@@ -217,7 +228,7 @@ class ToolCallParser:
 
     def extract_content_without_tools(self, text: str) -> str:
         """Remove tool call blocks, keep only text"""
-        return self.tool_call_complete_regex.sub('', text).strip()
+        return self.tool_call_complete_regex.sub('', text)
 
     def has_tool_calls(self, text: str) -> bool:
         """Check if text contains tool calls"""

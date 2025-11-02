@@ -21,6 +21,8 @@ class Settings(BaseSettings):
     # Logging
     log_level: str = "INFO"
     log_raw_responses: bool = False  # Log raw backend responses (debug)
+    enable_streaming_debug: bool = False  # Emit detailed streaming traces for troubleshooting
+    streaming_debug_path: str | None = None  # Optional file path for streaming trace logs
 
     model_config = SettingsConfigDict(
         env_file=".env",

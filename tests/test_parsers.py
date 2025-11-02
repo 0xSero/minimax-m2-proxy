@@ -3,6 +3,9 @@
 import pytest
 import json
 from parsers.tools import ToolCallParser
+from parsers.streaming import SimpleStreamingParser
+from parsers.reasoning import ensure_think_wrapped
+from formatters.openai import OpenAIFormatter
 
 
 class TestToolCallParser:
@@ -78,6 +81,16 @@ class TestToolCallParser:
         assert result["tools_called"] is False
         assert result["tool_calls"] == []
         assert result["content"] == text
+
+    def test_think_preservation_when_opening_missing(self):
+        """Ensure parser restores <think> tag when only </think> is present."""
+        text = "Reasoning in progress</think>\n<minimax:tool_call><invoke name=\"foo\"></invoke></minimax:tool_call>"
+
+        result = self.parser.parse_tool_calls(text)
+
+        assert result["tools_called"] is True
+        assert result["content"].startswith("<think>")
+        assert result["content"].rstrip().endswith("</think>")
 
     def test_type_inference_integer(self):
         """Test integer type inference"""
@@ -312,3 +325,102 @@ def hello():
         assert result["tools_called"] is True
         assert "<think>" in result["content"]
         assert len(result["tool_calls"]) == 1
+
+    def test_tool_call_preserves_think_and_followup_text(self):
+        """Ensure reasoning and final message survive parsing"""
+        text = """<think>I should look this up</think>
+
+<minimax:tool_call>
+<invoke name="web_search">
+<parameter name="query">interleaved thinking</parameter>
+</invoke>
+</minimax:tool_call>
+
+Here is what I found.
+"""
+
+        result = self.parser.parse_tool_calls(text)
+
+        assert result["tools_called"] is True
+        assert result["content"].startswith("<think>")
+        assert "Here is what I found." in result["content"]
+        assert result["content"].rstrip().endswith("Here is what I found.")
+
+
+class TestStreamingAndFormatting:
+    """Tests for streaming parser and OpenAI formatter compliance"""
+
+    def test_simple_streaming_parser_preserves_think(self):
+        parser = SimpleStreamingParser()
+        sample = """<think>Let me reason</think>
+
+<minimax:tool_call>
+<invoke name="web_search">
+<parameter name="query">interleaved thinking</parameter>
+</invoke>
+</minimax:tool_call>"""
+
+        result = parser.process_chunk(sample)
+
+        assert result is not None
+        assert result["type"] == "tool_calls"
+        assert result["content"].startswith("<think>")
+        assert result["content"].rstrip().endswith("</think>")
+
+    def test_openai_streaming_chunk_includes_index(self):
+        chunk = OpenAIFormatter.format_streaming_chunk(
+            tool_calls=[{"function": {"name": "web_search"}}]
+        )
+
+        payload = json.loads(chunk.split("data: ", 1)[1].strip())
+        call = payload["choices"][0]["delta"]["tool_calls"][0]
+
+        assert call["index"] == 0
+        assert call["function"]["name"] == "web_search"
+
+    def test_openai_tool_call_stream_structure(self):
+        tool_call = {
+            "id": "call_example",
+            "type": "function",
+            "function": {
+                "name": "web_search",
+                "arguments": "{\"query\": \"interleaved thinking\"}"
+            }
+        }
+
+        chunks = OpenAIFormatter.format_tool_call_stream(tool_call, index=0)
+
+        assert len(chunks) == 2
+
+        first = json.loads(chunks[0].split("data: ", 1)[1].strip())
+        first_call = first["choices"][0]["delta"]["tool_calls"][0]
+        assert first_call["id"] == "call_example"
+        assert first_call["type"] == "function"
+        assert first_call["index"] == 0
+        assert first_call["function"]["name"] == "web_search"
+
+        second = json.loads(chunks[1].split("data: ", 1)[1].strip())
+        second_call = second["choices"][0]["delta"]["tool_calls"][0]
+        assert "arguments" in second_call["function"]
+        assert second_call["index"] == 0
+
+
+def test_ensure_think_wrapped_adds_missing_opening():
+    """Helper adds opening <think> when only </think> is present."""
+    text = "   internal chain of thought</think>"
+    normalized, inserted = ensure_think_wrapped(text)
+
+    assert inserted is True
+    assert normalized.strip().startswith("<think>")
+    assert normalized.strip().endswith("</think>")
+
+
+def test_ensure_think_wrapped_idempotent():
+    """Applying helper twice never duplicates tags."""
+    text = "<think>\nreasoning</think>"
+    first, inserted_first = ensure_think_wrapped(text)
+    second, inserted_second = ensure_think_wrapped(first)
+
+    assert inserted_first is False
+    assert inserted_second is False
+    assert first == second == text
