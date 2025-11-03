@@ -19,6 +19,7 @@ from .models import (
     anthropic_tools_to_openai,
     anthropic_messages_to_openai
 )
+from .message_transformer import transform_messages_for_minimax
 from parsers.tools import ToolCallParser
 from parsers.streaming import SimpleStreamingParser
 from parsers.reasoning import ensure_think_wrapped
@@ -121,6 +122,9 @@ async def complete_openai_response(request: OpenAIChatRequest) -> dict:
     # Convert messages to dict
     messages = [msg.model_dump(exclude_none=True) for msg in request.messages]
 
+    # Transform messages for MiniMax compatibility (handles tool results)
+    messages = transform_messages_for_minimax(messages)
+
     # Convert tools if present
     tools = None
     if request.tools:
@@ -169,6 +173,9 @@ async def stream_openai_response(request: OpenAIChatRequest) -> AsyncIterator[st
 
     # Convert messages to dict
     messages = [msg.model_dump(exclude_none=True) for msg in request.messages]
+
+    # Transform messages for MiniMax compatibility (handles tool results)
+    messages = transform_messages_for_minimax(messages)
 
     # Convert tools if present
     tools = None
@@ -226,6 +233,9 @@ async def stream_openai_response(request: OpenAIChatRequest) -> AsyncIterator[st
                     pending_tail = streaming_parser.flush_pending()
                     if pending_tail:
                         yield openai_formatter.format_streaming_chunk(delta=pending_tail, model=request.model)
+                    # Override finish_reason if tool calls were detected
+                    if finish_reason == "stop" and streaming_parser.has_tool_calls():
+                        finish_reason = "tool_calls"
                     yield openai_formatter.format_streaming_chunk(finish_reason=finish_reason, model=request.model)
 
         # Send done
@@ -276,6 +286,9 @@ async def complete_anthropic_response(request: AnthropicChatRequest) -> dict:
         system_content = request.system if isinstance(request.system, str) else str(request.system)
         openai_messages.insert(0, {"role": "system", "content": system_content})
 
+    # Transform messages for MiniMax compatibility (handles tool results)
+    openai_messages = transform_messages_for_minimax(openai_messages)
+
     # Convert tools
     tools = anthropic_tools_to_openai(request.tools)
 
@@ -324,6 +337,9 @@ async def stream_anthropic_response(request: AnthropicChatRequest) -> AsyncItera
     if request.system:
         system_content = request.system if isinstance(request.system, str) else str(request.system)
         openai_messages.insert(0, {"role": "system", "content": system_content})
+
+    # Transform messages for MiniMax compatibility (handles tool results)
+    openai_messages = transform_messages_for_minimax(openai_messages)
 
     # Convert tools
     tools = anthropic_tools_to_openai(request.tools)
@@ -395,6 +411,10 @@ async def stream_anthropic_response(request: AnthropicChatRequest) -> AsyncItera
                     # Close last content block if open
                     if content_block_started:
                         yield anthropic_formatter.format_content_block_stop(content_block_index)
+
+                    # Override finish_reason if tool calls were detected
+                    if finish_reason == "stop" and streaming_parser.has_tool_calls():
+                        finish_reason = "tool_calls"
 
                     # Map finish reason
                     stop_reason = "end_turn" if finish_reason == "stop" else finish_reason
