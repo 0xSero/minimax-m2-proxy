@@ -121,6 +121,9 @@ async def complete_openai_response(request: OpenAIChatRequest) -> dict:
         tools = [tool.model_dump(exclude_none=True) for tool in request.tools]
 
     # Call TabbyAPI
+    banned_strings = settings.banned_chinese_strings if settings.enable_chinese_char_blocking else None
+    logger.info(f"Calling TabbyAPI with banned_strings enabled: {settings.enable_chinese_char_blocking}, count: {len(banned_strings) if banned_strings else 0}")
+
     response = await tabby_client.chat_completion(
         messages=messages,
         model=request.model,
@@ -131,7 +134,8 @@ async def complete_openai_response(request: OpenAIChatRequest) -> dict:
         stop=request.stop,
         tools=tools,
         tool_choice=request.tool_choice,
-        add_generation_prompt=True  # Required for <think> tags
+        add_generation_prompt=True,  # Required for <think> tags
+        banned_strings=banned_strings
     )
 
     if settings.log_raw_responses:
@@ -184,7 +188,8 @@ async def stream_openai_response(request: OpenAIChatRequest) -> AsyncIterator[st
             stop=request.stop,
             tools=tools,
             tool_choice=request.tool_choice,
-            add_generation_prompt=True  # Required for <think> tags
+            add_generation_prompt=True,  # Required for <think> tags
+            banned_strings=settings.banned_chinese_strings if settings.enable_chinese_char_blocking else None
         ):
             # Extract delta
             if "choices" in chunk and len(chunk["choices"]) > 0:
@@ -287,7 +292,8 @@ async def complete_anthropic_response(request: AnthropicChatRequest) -> dict:
         stop=request.stop_sequences,
         tools=tools,
         tool_choice=request.tool_choice,
-        add_generation_prompt=True  # Required for <think> tags
+        add_generation_prompt=True,  # Required for <think> tags
+        banned_strings=settings.banned_chinese_strings if settings.enable_chinese_char_blocking else None
     )
 
     if settings.log_raw_responses:
@@ -345,7 +351,8 @@ async def stream_anthropic_response(request: AnthropicChatRequest) -> AsyncItera
             stop=request.stop_sequences,
             tools=tools,
             tool_choice=request.tool_choice,
-            add_generation_prompt=True  # Required for <think> tags
+            add_generation_prompt=True,  # Required for <think> tags
+            banned_strings=settings.banned_chinese_strings if settings.enable_chinese_char_blocking else None
         ):
             # Extract delta
             if "choices" in chunk and len(chunk["choices"]) > 0:

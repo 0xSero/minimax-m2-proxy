@@ -17,6 +17,13 @@ class Settings(BaseSettings):
     # Feature flags
     enable_thinking_passthrough: bool = True  # Keep <think> blocks in responses
     enable_tool_translation: bool = True      # Translate <minimax:tool_call> to OpenAI/Anthropic
+    enable_chinese_char_blocking: bool = True  # Block Chinese character generation
+
+    # Chinese character blocking (fixes tokenizer vocab bleed)
+    banned_chinese_strings: list[str] = [
+        "、", "。", "，", "的", "了", "是", "在", "有", "个", "人", "这", "我",
+        "你", "他", "们", "来", "到", "时", "要", "就", "会", "可", "那", "些"
+    ]
 
     # Logging
     log_level: str = "INFO"
