@@ -1,0 +1,6 @@
+Collecting aiosqlite
+  Downloading aiosqlite-0.21.0-py3-none-any.whl.metadata (4.3 kB)
+Requirement already satisfied: typing_extensions>=4.0 in ./venv/lib/python3.11/site-packages (from aiosqlite) (4.15.0)
+Downloading aiosqlite-0.21.0-py3-none-any.whl (15 kB)
+Installing collected packages: aiosqlite
+Successfully installed aiosqlite-0.21.0

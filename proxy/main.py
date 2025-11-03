@@ -19,9 +19,8 @@ from .models import (
     anthropic_tools_to_openai,
     anthropic_messages_to_openai
 )
-from .message_transformer import transform_messages_for_minimax
-from parsers.tools import ToolCallParser
-from parsers.streaming import SimpleStreamingParser
+from parsers.tools import parse_tool_calls
+from parsers.streaming import StreamingParser
 from parsers.reasoning import ensure_think_wrapped
 from formatters.openai import OpenAIFormatter
 from formatters.anthropic import AnthropicFormatter
@@ -47,9 +46,8 @@ if settings.enable_streaming_debug:
 else:
     stream_logger.setLevel(logging.INFO)
 
-# Global client instance
+# Global instances
 tabby_client: TabbyClient = None
-tool_parser = ToolCallParser()
 openai_formatter = OpenAIFormatter()
 anthropic_formatter = AnthropicFormatter()
 
@@ -63,12 +61,7 @@ async def lifespan(app: FastAPI):
     logger.info(f"Starting MiniMax-M2 Proxy on {settings.host}:{settings.port}")
     logger.info(f"Backend TabbyAPI: {settings.tabby_url}")
 
-    tabby_client = TabbyClient(
-        settings.tabby_url,
-        settings.tabby_timeout,
-        log_stream_raw=settings.enable_streaming_debug,
-        stream_logger=stream_logger
-    )
+    tabby_client = TabbyClient(settings.tabby_url, settings.tabby_timeout)
 
     # Check backend health
     if await tabby_client.health_check():
@@ -122,9 +115,6 @@ async def complete_openai_response(request: OpenAIChatRequest) -> dict:
     # Convert messages to dict
     messages = [msg.model_dump(exclude_none=True) for msg in request.messages]
 
-    # Transform messages for MiniMax compatibility (handles tool results)
-    messages = transform_messages_for_minimax(messages)
-
     # Convert tools if present
     tools = None
     if request.tools:
@@ -140,7 +130,8 @@ async def complete_openai_response(request: OpenAIChatRequest) -> dict:
         top_k=request.top_k,
         stop=request.stop,
         tools=tools,
-        tool_choice=request.tool_choice
+        tool_choice=request.tool_choice,
+        add_generation_prompt=True  # Required for <think> tags
     )
 
     if settings.log_raw_responses:
@@ -148,19 +139,17 @@ async def complete_openai_response(request: OpenAIChatRequest) -> dict:
 
     # Extract raw content (contains XML and <think> blocks)
     raw_content = response["choices"][0]["message"].get("content", "")
-    raw_content, _ = ensure_think_wrapped(raw_content)
 
-    # Parse tool calls and preserve <think> blocks in content
-    result = tool_parser.parse_tool_calls(raw_content, tools)
+    # Ensure think tags are wrapped (TabbyAPI includes closing but not opening tag)
+    raw_content = ensure_think_wrapped(raw_content)
 
-    content_payload = raw_content if not result["tools_called"] else result["content"]
+    # Parse tool calls
+    result = parse_tool_calls(raw_content, tools)
 
-    if result["tools_called"] and content_payload is None:
-        stripped_content = tool_parser.extract_content_without_tools(raw_content)
-        if stripped_content and stripped_content.strip():
-            content_payload, _ = ensure_think_wrapped(stripped_content.rstrip())
+    # Use parsed content if tool calls were found, otherwise use raw content
+    content_payload = result["content"] if result["tools_called"] else raw_content
 
-    # Format response with <think> blocks preserved in content
+    # Format response
     return openai_formatter.format_complete_response(
         content=content_payload,
         tool_calls=result["tool_calls"] if result["tools_called"] else None,
@@ -174,19 +163,14 @@ async def stream_openai_response(request: OpenAIChatRequest) -> AsyncIterator[st
     # Convert messages to dict
     messages = [msg.model_dump(exclude_none=True) for msg in request.messages]
 
-    # Transform messages for MiniMax compatibility (handles tool results)
-    messages = transform_messages_for_minimax(messages)
-
     # Convert tools if present
     tools = None
     if request.tools:
         tools = [tool.model_dump(exclude_none=True) for tool in request.tools]
 
-    # Initialize streaming parser to preserve <think> blocks
-    streaming_parser = SimpleStreamingParser()
+    # Initialize streaming parser
+    streaming_parser = StreamingParser()
     streaming_parser.set_tools(tools)
-    if settings.enable_streaming_debug:
-        streaming_parser.set_logger(stream_logger)
 
     try:
         # Stream from TabbyAPI
@@ -199,7 +183,8 @@ async def stream_openai_response(request: OpenAIChatRequest) -> AsyncIterator[st
             top_k=request.top_k,
             stop=request.stop,
             tools=tools,
-            tool_choice=request.tool_choice
+            tool_choice=request.tool_choice,
+            add_generation_prompt=True  # Required for <think> tags
         ):
             # Extract delta
             if "choices" in chunk and len(chunk["choices"]) > 0:
@@ -218,10 +203,6 @@ async def stream_openai_response(request: OpenAIChatRequest) -> AsyncIterator[st
                             yield openai_formatter.format_streaming_chunk(delta=parsed["delta"], model=request.model)
 
                         elif parsed["type"] == "tool_calls":
-                            # Send content first if present (includes <think> blocks)
-                            if parsed.get("content"):
-                                yield openai_formatter.format_streaming_chunk(delta=parsed["content"], model=request.model)
-
                             # Send tool calls as compliant streaming deltas
                             for idx, tool_call in enumerate(parsed["tool_calls"]):
                                 for tool_chunk in openai_formatter.format_tool_call_stream(tool_call, idx, model=request.model):
@@ -286,11 +267,14 @@ async def complete_anthropic_response(request: AnthropicChatRequest) -> dict:
         system_content = request.system if isinstance(request.system, str) else str(request.system)
         openai_messages.insert(0, {"role": "system", "content": system_content})
 
-    # Transform messages for MiniMax compatibility (handles tool results)
-    openai_messages = transform_messages_for_minimax(openai_messages)
-
     # Convert tools
     tools = anthropic_tools_to_openai(request.tools)
+
+    # Debug logging
+    import pprint
+    logger.debug(f"Converted {len(openai_messages)} messages to OpenAI format:")
+    for i, msg in enumerate(openai_messages):
+        logger.debug(f"  Message {i}: role={msg.get('role')}, content_len={len(str(msg.get('content', '')))}, has_tool_calls={bool(msg.get('tool_calls'))}")
 
     # Call TabbyAPI
     response = await tabby_client.chat_completion(
@@ -302,7 +286,8 @@ async def complete_anthropic_response(request: AnthropicChatRequest) -> dict:
         top_k=request.top_k,
         stop=request.stop_sequences,
         tools=tools,
-        tool_choice=request.tool_choice
+        tool_choice=request.tool_choice,
+        add_generation_prompt=True  # Required for <think> tags
     )
 
     if settings.log_raw_responses:
@@ -310,16 +295,12 @@ async def complete_anthropic_response(request: AnthropicChatRequest) -> dict:
 
     # Extract raw content (contains XML and <think> blocks)
     raw_content = response["choices"][0]["message"].get("content", "")
+    raw_content = ensure_think_wrapped(raw_content)
 
-    # IMPORTANT: TabbyAPI doesn't include the opening <think> tag in completions
-    # because it's part of the generation prompt. We need to add it back.
-    if raw_content and "</think>" in raw_content and not raw_content.strip().startswith("<think>"):
-        raw_content = "<think>\n" + raw_content
+    # Parse tool calls
+    result = parse_tool_calls(raw_content, tools)
 
-    # Parse tool calls and preserve <think> blocks
-    result = tool_parser.parse_tool_calls(raw_content, tools)
-
-    # Format as Anthropic response with <think> blocks preserved
+    # Format as Anthropic response
     return anthropic_formatter.format_complete_response(
         content=result["content"] if result["tools_called"] else raw_content,
         tool_calls=result["tool_calls"] if result["tools_called"] else None,
@@ -338,14 +319,11 @@ async def stream_anthropic_response(request: AnthropicChatRequest) -> AsyncItera
         system_content = request.system if isinstance(request.system, str) else str(request.system)
         openai_messages.insert(0, {"role": "system", "content": system_content})
 
-    # Transform messages for MiniMax compatibility (handles tool results)
-    openai_messages = transform_messages_for_minimax(openai_messages)
-
     # Convert tools
     tools = anthropic_tools_to_openai(request.tools)
 
-    # Initialize streaming parser to preserve <think> blocks
-    streaming_parser = SimpleStreamingParser()
+    # Initialize streaming parser
+    streaming_parser = StreamingParser()
     streaming_parser.set_tools(tools)
 
     try:
@@ -366,7 +344,8 @@ async def stream_anthropic_response(request: AnthropicChatRequest) -> AsyncItera
             top_k=request.top_k,
             stop=request.stop_sequences,
             tools=tools,
-            tool_choice=request.tool_choice
+            tool_choice=request.tool_choice,
+            add_generation_prompt=True  # Required for <think> tags
         ):
             # Extract delta
             if "choices" in chunk and len(chunk["choices"]) > 0:
@@ -453,7 +432,8 @@ async def root():
     """Root endpoint with service info"""
     return {
         "service": "MiniMax-M2 Proxy",
-        "version": "0.1.0",
+        "version": "0.2.0-simplified",
+        "code_version": "think_tags_preserved",
         "endpoints": {
             "openai": "/v1/chat/completions",
             "anthropic": "/v1/messages",
