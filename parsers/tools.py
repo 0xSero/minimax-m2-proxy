@@ -1,6 +1,7 @@
 """Tool call parser for MiniMax-M2 XML format
 
-Adapted from VLLM's minimax_m2_tool_parser.py
+Based on official MiniMax guide:
+https://platform.minimax.io/docs/guides/text-m2-function-call
 """
 
 import json
@@ -8,228 +9,157 @@ import re
 import uuid
 from typing import Any, Dict, List, Optional
 
-from .reasoning import ensure_think_wrapped
+
+def extract_name(name_str: str) -> str:
+    """Extract name from quoted string"""
+    name_str = name_str.strip()
+    if (name_str.startswith('"') and name_str.endswith('"')) or \
+       (name_str.startswith("'") and name_str.endswith("'")):
+        return name_str[1:-1]
+    return name_str
 
 
-class ToolCall(Dict[str, Any]):
-    """OpenAI-format tool call"""
+def convert_param_value(value: str, param_type: str) -> Any:
+    """Convert parameter value based on parameter type"""
+    if value.lower() == "null":
+        return None
 
-    def __init__(
-        self,
-        id: str,
-        type: str,
-        function: Dict[str, str]
-    ):
-        super().__init__(
-            id=id,
-            type=type,
-            function=function
-        )
+    param_type = param_type.lower()
 
-
-class ToolCallParser:
-    """Parse <minimax:tool_call> XML format to OpenAI tool calls"""
-
-    def __init__(self):
-        # Sentinel tokens
-        self.tool_call_start_token = "<minimax:tool_call>"
-        self.tool_call_end_token = "</minimax:tool_call>"
-        self.invoke_start_prefix = "<invoke name="
-        self.invoke_end_token = "</invoke>"
-        self.parameter_prefix = "<parameter name="
-        self.parameter_end_token = "</parameter>"
-
-        # Regex patterns for complete parsing
-        self.tool_call_complete_regex = re.compile(
-            r"<minimax:tool_call>(.*?)</minimax:tool_call>", re.DOTALL
-        )
-        self.invoke_complete_regex = re.compile(
-            r"<invoke name=(.*?)</invoke>", re.DOTALL
-        )
-        self.parameter_complete_regex = re.compile(
-            r"<parameter name=(.*?)</parameter>", re.DOTALL
-        )
-
-    def _generate_tool_call_id(self) -> str:
-        """Generate a unique tool call ID"""
-        return f"call_{uuid.uuid4().hex[:24]}"
-
-    def _extract_name(self, name_str: str) -> str:
-        """Extract name from quoted string"""
-        name_str = name_str.strip()
-        if (
-            name_str.startswith('"') and name_str.endswith('"')
-            or name_str.startswith("'") and name_str.endswith("'")
-        ):
-            return name_str[1:-1]
-        return name_str
-
-    def _convert_param_value(self, value: str, param_type: str = "string") -> Any:
-        """Convert parameter value to the correct type"""
-        if value.lower() == "null":
-            return None
-
-        param_type = param_type.lower()
-        if param_type in ["string", "str", "text"]:
+    if param_type in ["string", "str", "text"]:
+        return value
+    elif param_type in ["integer", "int"]:
+        try:
+            return int(value)
+        except (ValueError, TypeError):
             return value
-        elif param_type in ["integer", "int"]:
-            try:
-                return int(value)
-            except (ValueError, TypeError):
-                return value
-        elif param_type in ["number", "float"]:
-            try:
-                val = float(value)
-                return val if val != int(val) else int(val)
-            except (ValueError, TypeError):
-                return value
-        elif param_type in ["boolean", "bool"]:
-            return value.lower() in ["true", "1"]
-        elif param_type in ["object", "array"]:
-            try:
-                return json.loads(value)
-            except json.JSONDecodeError:
-                return value
-        else:
-            # Try JSON parse first, fallback to string
-            try:
-                return json.loads(value)
-            except json.JSONDecodeError:
-                return value
+    elif param_type in ["number", "float"]:
+        try:
+            val = float(value)
+            return val if val != int(val) else int(val)
+        except (ValueError, TypeError):
+            return value
+    elif param_type in ["boolean", "bool"]:
+        return value.lower() in ["true", "1"]
+    elif param_type in ["object", "array"]:
+        try:
+            return json.loads(value)
+        except json.JSONDecodeError:
+            return value
+    else:
+        # Try JSON parsing, return string if failed
+        try:
+            return json.loads(value)
+        except json.JSONDecodeError:
+            return value
 
-    def _parse_single_invoke(
-        self,
-        invoke_str: str,
-        tools: Optional[List[Dict]] = None
-    ) -> Optional[Dict[str, Any]]:
-        """Parse a single <invoke> block"""
-        # Extract function name
-        name_match = re.search(r"^([^>]+)", invoke_str)
-        if not name_match:
-            return None
 
-        function_name = self._extract_name(name_match.group(1))
+def parse_tool_calls(model_output: str, tools: Optional[List[Dict]] = None) -> Dict[str, Any]:
+    """
+    Extract all tool calls from model output.
 
-        # Get parameter configuration
-        param_config = {}
-        if tools:
-            for tool in tools:
-                if isinstance(tool, dict):
-                    # OpenAI format: {type: "function", function: {name, parameters}}
-                    func = tool.get("function", {})
-                    if func.get("name") == function_name:
-                        params = func.get("parameters", {})
-                        if isinstance(params, dict) and "properties" in params:
-                            param_config = params["properties"]
-                        break
+    Args:
+        model_output: Complete output text from the model
+        tools: Tool definition list for getting parameter type information
 
-        # Extract parameters
-        param_dict = {}
-        for match in self.parameter_complete_regex.findall(invoke_str):
-            param_match = re.search(r"^([^>]+)>(.*)", match, re.DOTALL)
-            if param_match:
-                param_name = self._extract_name(param_match.group(1))
-                param_value = param_match.group(2).strip()
-                if param_value.startswith("\n"):
-                    param_value = param_value[1:]
-                if param_value.endswith("\n"):
-                    param_value = param_value[:-1]
-
-                # Get parameter type
-                param_type = "string"
-                if (
-                    param_name in param_config
-                    and isinstance(param_config[param_name], dict)
-                    and "type" in param_config[param_name]
-                ):
-                    param_type = param_config[param_name]["type"]
-
-                # Convert value
-                param_dict[param_name] = self._convert_param_value(
-                    param_value, param_type
-                )
-
+    Returns:
+        {
+            "tools_called": bool,
+            "tool_calls": List[Dict],  # OpenAI format
+            "content": str  # Content without tool call blocks
+        }
+    """
+    # Quick check if tool call marker is present
+    if "<minimax:tool_call>" not in model_output:
         return {
-            "id": self._generate_tool_call_id(),
-            "type": "function",
-            "function": {
-                "name": function_name,
-                "arguments": json.dumps(param_dict, ensure_ascii=False)
-            }
+            "tools_called": False,
+            "tool_calls": [],
+            "content": model_output
         }
 
-    def parse_tool_calls(
-        self,
-        text: str,
-        tools: Optional[List[Dict]] = None
-    ) -> Dict[str, Any]:
-        """
-        Extract tool calls from complete text (non-streaming).
+    tool_calls = []
 
-        Returns:
-            {
-                "tools_called": bool,
-                "tool_calls": List[Dict],
-                "content": str  # Content without tool call blocks
-            }
-        """
-        # Normalise reasoning tags before any parsing so downstream helpers see
-        # balanced <think> blocks even though Tabby omits the opening tag.
-        normalized_text, _ = ensure_think_wrapped(text)
-        text = normalized_text
+    try:
+        # Match all <minimax:tool_call> blocks
+        tool_call_regex = re.compile(r"<minimax:tool_call>(.*?)</minimax:tool_call>", re.DOTALL)
+        invoke_regex = re.compile(r"<invoke name=(.*?)</invoke>", re.DOTALL)
+        parameter_regex = re.compile(r"<parameter name=(.*?)</parameter>", re.DOTALL)
 
-        # Quick check
-        if self.tool_call_start_token not in text:
-            return {
-                "tools_called": False,
-                "tool_calls": [],
-                "content": normalized_text
-            }
+        # Iterate through all tool_call blocks
+        for tool_call_match in tool_call_regex.findall(model_output):
+            # Iterate through all invokes in this block
+            for invoke_match in invoke_regex.findall(tool_call_match):
+                # Extract function name
+                name_match = re.search(r'^([^>]+)', invoke_match)
+                if not name_match:
+                    continue
 
-        try:
-            tool_calls = []
+                function_name = extract_name(name_match.group(1))
 
-            # Find all complete tool_call blocks
-            for tool_call_match in self.tool_call_complete_regex.findall(text):
-                # Find all invokes within this tool_call
-                for invoke_match in self.invoke_complete_regex.findall(tool_call_match):
-                    tool_call = self._parse_single_invoke(invoke_match, tools)
-                    if tool_call:
-                        tool_calls.append(tool_call)
+                # Get parameter configuration
+                param_config = {}
+                if tools:
+                    for tool in tools:
+                        tool_name = tool.get("name") or tool.get("function", {}).get("name")
+                        if tool_name == function_name:
+                            params = tool.get("parameters") or tool.get("function", {}).get("parameters")
+                            if isinstance(params, dict) and "properties" in params:
+                                param_config = params["properties"]
+                            break
 
-            if not tool_calls:
-                return {
-                    "tools_called": False,
-                    "tool_calls": [],
-                    "content": text
-                }
+                # Extract parameters
+                param_dict = {}
+                for match in parameter_regex.findall(invoke_match):
+                    param_match = re.search(r'^([^>]+)>(.*)', match, re.DOTALL)
+                    if param_match:
+                        param_name = extract_name(param_match.group(1))
+                        param_value = param_match.group(2).strip()
 
-            # Extract content without tool call blocks so reasoning is preserved
-            content = self.extract_content_without_tools(text)
-            if content is not None:
-                if content.strip() == "":
-                    content = None
-                else:
-                    content, _ = ensure_think_wrapped(content.rstrip())
+                        # Remove leading and trailing newlines
+                        if param_value.startswith('\n'):
+                            param_value = param_value[1:]
+                        if param_value.endswith('\n'):
+                            param_value = param_value[:-1]
 
-            return {
-                "tools_called": True,
-                "tool_calls": tool_calls,
-                "content": content
-            }
+                        # Get parameter type and convert
+                        param_type = "string"
+                        if param_name in param_config:
+                            if isinstance(param_config[param_name], dict) and "type" in param_config[param_name]:
+                                param_type = param_config[param_name]["type"]
 
-        except Exception as e:
-            print(f"Error extracting tool calls: {e}")
-            return {
-                "tools_called": False,
-                "tool_calls": [],
-                "content": text
-            }
+                        param_dict[param_name] = convert_param_value(param_value, param_type)
 
-    def extract_content_without_tools(self, text: str) -> str:
-        """Remove tool call blocks, keep only text"""
-        return self.tool_call_complete_regex.sub('', text)
+                # Build OpenAI-format tool call
+                tool_calls.append({
+                    "id": f"call_{uuid.uuid4().hex[:24]}",
+                    "type": "function",
+                    "function": {
+                        "name": function_name,
+                        "arguments": json.dumps(param_dict, ensure_ascii=False)
+                    }
+                })
 
-    def has_tool_calls(self, text: str) -> bool:
-        """Check if text contains tool calls"""
-        return self.tool_call_start_token in text
+    except Exception as e:
+        print(f"Failed to parse tool calls: {e}")
+        return {
+            "tools_called": False,
+            "tool_calls": [],
+            "content": model_output
+        }
+
+    if not tool_calls:
+        return {
+            "tools_called": False,
+            "tool_calls": [],
+            "content": model_output
+        }
+
+    # Extract content without tool call blocks
+    content_regex = re.compile(r"<minimax:tool_call>.*?</minimax:tool_call>", re.DOTALL)
+    content = content_regex.sub('', model_output).strip()
+
+    return {
+        "tools_called": True,
+        "tool_calls": tool_calls,
+        "content": content if content else None
+    }

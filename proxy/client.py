@@ -2,21 +2,13 @@
 
 import httpx
 import json
-import logging
-from typing import Dict, Any, AsyncIterator, Optional, List
+from typing import Dict, Any, AsyncIterator, List
 
 
 class TabbyClient:
     """Async HTTP client for TabbyAPI backend"""
 
-    def __init__(
-        self,
-        base_url: str,
-        timeout: int = 300,
-        *,
-        log_stream_raw: bool = False,
-        stream_logger: Optional[logging.Logger] = None
-    ):
+    def __init__(self, base_url: str, timeout: int = 300):
         """
         Initialize TabbyAPI client.
 
@@ -27,8 +19,6 @@ class TabbyClient:
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
         self.client = httpx.AsyncClient(timeout=timeout)
-        self.log_stream_raw = log_stream_raw
-        self.stream_logger = stream_logger or logging.getLogger("minimax.streaming")
 
     async def close(self):
         """Close the HTTP client"""
@@ -104,9 +94,6 @@ class TabbyClient:
 
             async for line in response.aiter_lines():
                 if line.startswith("data: "):
-                    if self.log_stream_raw:
-                        self.stream_logger.debug("tabby_sse %s", line)
-                    # Pass through complete SSE data line
                     yield line
 
     async def extract_streaming_content(
@@ -118,7 +105,7 @@ class TabbyClient:
         """
         Stream chat completions and extract content deltas.
 
-        Yields parsed chunk dicts with 'delta' field.
+        Yields parsed chunk dicts.
         """
         async for line in self.chat_completion_stream(messages, model, **kwargs):
             if line.startswith("data: "):
@@ -130,11 +117,8 @@ class TabbyClient:
                 try:
                     chunk = json.loads(data_str)
                     if "choices" in chunk and len(chunk["choices"]) > 0:
-                        if self.log_stream_raw:
-                            self.stream_logger.debug("tabby_chunk %s", json.dumps(chunk, ensure_ascii=False))
                         yield chunk
                 except json.JSONDecodeError:
-                    # Skip invalid JSON
                     continue
 
     async def health_check(self) -> bool:

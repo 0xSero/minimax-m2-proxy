@@ -96,7 +96,11 @@ def anthropic_tools_to_openai(tools: Optional[List[AnthropicTool]]) -> Optional[
 
 
 def anthropic_messages_to_openai(messages: List[AnthropicMessage]) -> List[Dict[str, Any]]:
-    """Convert Anthropic messages to OpenAI format"""
+    """Convert Anthropic messages to OpenAI format
+
+    CRITICAL: MiniMax-M2 chat template does NOT support role="tool".
+    Tool results must be sent as role="user" messages as per MiniMax docs.
+    """
     openai_messages = []
 
     for msg in messages:
@@ -110,6 +114,7 @@ def anthropic_messages_to_openai(messages: List[AnthropicMessage]) -> List[Dict[
             # Content blocks - merge text blocks
             text_parts = []
             tool_calls = []
+            tool_results = []
 
             for block in msg.content:
                 if block.type == "text" and block.text:
@@ -124,13 +129,13 @@ def anthropic_messages_to_openai(messages: List[AnthropicMessage]) -> List[Dict[
                         }
                     })
                 elif block.type == "tool_result":
-                    # Tool result becomes a tool role message
-                    openai_messages.append({
-                        "role": "tool",
-                        "tool_call_id": block.tool_use_id,
+                    # Collect tool results - will be formatted as user message content
+                    tool_results.append({
+                        "tool_use_id": block.tool_use_id,
                         "content": block.content if isinstance(block.content, str) else str(block.content)
                     })
 
+            # Build message
             if text_parts or tool_calls:
                 message = {
                     "role": msg.role,
@@ -139,5 +144,14 @@ def anthropic_messages_to_openai(messages: List[AnthropicMessage]) -> List[Dict[
                 if tool_calls:
                     message["tool_calls"] = tool_calls
                 openai_messages.append(message)
+
+            # Tool results become user messages (NOT role="tool")
+            # This matches MiniMax's expected format
+            if tool_results:
+                for result in tool_results:
+                    openai_messages.append({
+                        "role": "user",
+                        "content": f"Tool result for {result['tool_use_id']}: {result['content']}"
+                    })
 
     return openai_messages
