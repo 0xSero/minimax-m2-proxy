@@ -37,6 +37,10 @@ class StreamingParser:
         """Set tools configuration for type conversion"""
         self.tools = tools
 
+    def has_tool_calls(self) -> bool:
+        """Check if any tool calls were detected and sent during streaming"""
+        return len(self.sent_tool_calls) > 0
+
     def process_delta(
         self,
         delta_text: str
@@ -139,6 +143,10 @@ class SimpleStreamingParser:
     def set_logger(self, logger: logging.Logger):
         """Attach a debug logger for streaming diagnostics."""
         self.logger = logger
+
+    def has_tool_calls(self) -> bool:
+        """Check if any tool calls were detected and sent during streaming"""
+        return self.tools_sent
 
     def _log(self, message: str, **context):
         if self.logger:
