@@ -1,17 +1,35 @@
 """Pydantic models for API requests and responses"""
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from typing import List, Optional, Dict, Any, Literal, Union
 
 
 # OpenAI Models
 class OpenAIMessage(BaseModel):
-    """OpenAI message format"""
+    """OpenAI message format - accepts both string and Anthropic-style array content"""
     role: Literal["system", "user", "assistant", "tool"]
-    content: Optional[str] = None
+    content: Optional[Union[str, List[Dict[str, Any]]]] = None
     tool_calls: Optional[List[Dict[str, Any]]] = None
     tool_call_id: Optional[str] = None
     name: Optional[str] = None
+
+    @field_validator('content', mode='before')
+    @classmethod
+    def flatten_content(cls, v):
+        """Flatten Anthropic-style content arrays to strings for OpenAI compatibility"""
+        if isinstance(v, list):
+            # Extract text from Anthropic content blocks
+            text_parts = []
+            for block in v:
+                if isinstance(block, dict):
+                    # Handle text blocks
+                    if block.get('type') == 'text' and 'text' in block:
+                        text_parts.append(block['text'])
+                    # Handle simple text dict
+                    elif 'text' in block:
+                        text_parts.append(block['text'])
+            return '\n\n'.join(text_parts) if text_parts else ''
+        return v
 
 
 class OpenAITool(BaseModel):
