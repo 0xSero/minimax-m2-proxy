@@ -1,5 +1,7 @@
 """Configuration settings for MiniMax-M2 Proxy"""
 
+from typing import Literal, Optional
+
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -19,6 +21,24 @@ class Settings(BaseSettings):
     enable_tool_translation: bool = True      # Translate <minimax:tool_call> to OpenAI/Anthropic
     enable_chinese_char_blocking: bool = True  # Block Chinese character generation
 
+    # Session/history repair settings
+    session_store_enabled: bool = False
+    session_store_backend: Literal["memory", "sqlite"] = "sqlite"
+    session_store_path: str = "conversations.db"
+    session_ttl_seconds: int = 3600
+    max_messages_per_session: int = 8
+    require_session_for_repair: bool = True
+
+    # Reasoning/thinking presentation
+    enable_reasoning_split: bool = True
+    enable_anthropic_thinking_blocks: bool = True
+
+    # Validation toggles
+    require_tool_link_validation: bool = True
+
+    # Simple auth
+    auth_api_key: Optional[str] = None
+
     # Chinese character blocking (fixes tokenizer vocab bleed)
     banned_chinese_strings: list[str] = [
         "、", "。", "，", "的", "了", "是", "在", "有", "个", "人", "这", "我",
@@ -29,7 +49,7 @@ class Settings(BaseSettings):
     log_level: str = "INFO"
     log_raw_responses: bool = False  # Log raw backend responses (debug)
     enable_streaming_debug: bool = False  # Emit detailed streaming traces for troubleshooting
-    streaming_debug_path: str | None = None  # Optional file path for streaming trace logs
+    streaming_debug_path: Optional[str] = None  # Optional file path for streaming trace logs
 
     model_config = SettingsConfigDict(
         env_file=".env",

@@ -14,7 +14,8 @@ class AnthropicFormatter:
         content: Optional[str],
         tool_calls: Optional[List[Dict[str, Any]]] = None,
         model: str = "minimax-m2",
-        stop_reason: str = "end_turn"
+        stop_reason: str = "end_turn",
+        thinking_text: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Format a complete (non-streaming) response.
@@ -30,7 +31,12 @@ class AnthropicFormatter:
         """
         content_blocks = []
 
-        # Add text content (keeping <think> blocks as-is)
+        if thinking_text:
+            content_blocks.append({
+                "type": "thinking",
+                "thinking": thinking_text
+            })
+
         if content:
             content_blocks.append({
                 "type": "text",
@@ -112,19 +118,22 @@ class AnthropicFormatter:
         block = {"type": block_type}
         if block_type == "text":
             block["text"] = ""
+        elif block_type == "thinking":
+            block["thinking"] = ""
         return AnthropicFormatter.format_streaming_event(
             "content_block_start",
             {"index": index, "content_block": block}
         )
 
     @staticmethod
-    def format_content_block_delta(index: int, delta: str) -> str:
-        """Format content_block_delta event for text"""
+    def format_content_block_delta(index: int, delta: str, delta_type: str = "text_delta") -> str:
+        """Format content_block_delta event"""
+        payload_key = "text" if delta_type == "text_delta" else "thinking"
         return AnthropicFormatter.format_streaming_event(
             "content_block_delta",
             {
                 "index": index,
-                "delta": {"type": "text_delta", "text": delta}
+                "delta": {"type": delta_type, payload_key: delta}
             }
         )
 

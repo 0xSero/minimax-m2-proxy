@@ -14,7 +14,8 @@ class OpenAIFormatter:
         content: Optional[str],
         tool_calls: Optional[List[Dict[str, Any]]] = None,
         model: str = "minimax-m2",
-        finish_reason: str = "stop"
+        finish_reason: str = "stop",
+        reasoning_text: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Format a complete (non-streaming) response.
@@ -31,12 +32,16 @@ class OpenAIFormatter:
         message: Dict[str, Any] = {"role": "assistant"}
 
         if tool_calls:
-            # OpenAI spec: content can be None or string when tool_calls present
             message["content"] = content
             message["tool_calls"] = tool_calls
             finish_reason = "tool_calls"
         else:
             message["content"] = content or ""
+
+        if reasoning_text:
+            message["reasoning_details"] = [
+                {"type": "chain_of_thought", "text": reasoning_text}
+            ]
 
         return {
             "id": f"chatcmpl-{uuid.uuid4().hex[:29]}",
@@ -61,7 +66,8 @@ class OpenAIFormatter:
         delta: Optional[str] = None,
         tool_calls: Optional[List[Dict[str, Any]]] = None,
         finish_reason: Optional[str] = None,
-        model: str = "minimax-m2"
+        model: str = "minimax-m2",
+        reasoning_delta: Optional[str] = None,
     ) -> str:
         """
         Format a streaming chunk in Server-Sent Events format.
@@ -80,6 +86,11 @@ class OpenAIFormatter:
         if delta is not None:
             delta_content["content"] = delta
 
+        if reasoning_delta is not None:
+            delta_content["reasoning_details"] = [
+                {"type": "chain_of_thought", "text": reasoning_delta}
+            ]
+
         if tool_calls is not None:
             normalized_calls = []
             for idx, call in enumerate(tool_calls):
@@ -94,14 +105,14 @@ class OpenAIFormatter:
                 normalized_calls.append(call_entry)
             delta_content["tool_calls"] = normalized_calls
 
-        chunk = {
+        chunk: Dict[str, Any] = {
             "id": f"chatcmpl-{uuid.uuid4().hex[:29]}",
             "object": "chat.completion.chunk",
             "created": int(time.time()),
             "model": model,
             "choices": [{
                 "index": 0,
-                "delta": delta_content,
+                "delta": delta_content or {},
                 "logprobs": None,
                 "finish_reason": finish_reason
             }]
