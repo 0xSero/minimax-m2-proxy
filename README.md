@@ -4,7 +4,7 @@ A translation proxy that makes [MiniMax-M2](https://huggingface.co/MiniMaxAI/Min
 
 ## Why This Exists
 
-MiniMax-M2 is a powerful 456B MoE model with exceptional reasoning capabilities, but it uses a **custom XML-based format** for tool calling that most UIs and frameworks don't understand:
+MiniMax-M2 is a powerful 229B MoE model with exceptional reasoning capabilities, but it uses a **custom XML-based format** for tool calling that most UIs and frameworks don't understand:
 
 ```xml
 <think>Let me analyze this request...</think>
@@ -353,46 +353,49 @@ The template teaches the model to output:
 - `<think>...</think>` for reasoning
 - `<minimax:tool_call>` with `<invoke>` and `<parameter>` tags
 
-## Testing
+## Development Workflow
 
-### Unit Tests
+### Running the Proxy Locally
 
-```bash
-source venv/bin/activate
-pytest tests/test_parsers.py -v
-
-# All 16 tests should pass:
-# ✅ Basic tool call parsing
-# ✅ Multiple tool calls
-# ✅ Type conversion (int, float, bool, null)
-# ✅ JSON objects and arrays
-# ✅ Edge cases (empty parameters, special characters)
-```
-
-### End-to-End Tests
-
-Requires TabbyAPI running on port 8000:
+We ship a small helper script for common tasks:
 
 ```bash
-# Terminal 1: Start TabbyAPI
-cd /mnt/llm_models/tabbyAPI
-venv/bin/python main.py --port 8000
+# Auto-reload development server (default host/port: 0.0.0.0:8001)
+scripts/proxy.sh dev
 
-# Terminal 2: Start proxy
-cd ~/minimax-m2-proxy
-source venv/bin/activate
-uvicorn proxy.main:app --port 8001
-
-# Terminal 3: Run tests
-python tests/test_tool_calling.py
-
-# Tests:
-# ✅ Think blocks preservation
-# ✅ Single tool call (OpenAI)
-# ✅ Multi-step tool calling (tool → result → final answer)
-# ✅ Anthropic format
-# ✅ Streaming with tools
+# Production-style foreground server
+scripts/proxy.sh serve
 ```
+
+You can override the Python binary or bind address via environment variables:
+
+```bash
+PYTHON_BIN=python3.11 HOST=127.0.0.1 PORT=9000 scripts/proxy.sh dev
+```
+
+### Tests
+
+The test harness now uses `pytest` with lightweight stubs for TabbyAPI, so we no longer
+depend on a running backend when exercising unit or integration behaviour.
+
+```bash
+# Run the full suite
+scripts/proxy.sh test
+
+# Pass extra arguments through to pytest
+scripts/proxy.sh test -k openai --maxfail=1
+```
+
+Tests are organised under `tests/`:
+
+- `tests/unit/` covers pure helpers (reasoning split, streaming parser, session store)
+- `tests/integration/` hits the FastAPI endpoint helpers with stubbed Tabby responses
+
+## Documentation
+
+Detailed integration guides live under [`docs/`](./docs/index.md). Start with the
+[introduction](./docs/introduction.md) and [quick start](./docs/quickstart.md), then jump to the
+[OpenAI](./docs/openai.md) or [Anthropic](./docs/anthropic.md) walkthrough depending on your client.
 
 ## Project Structure
 
@@ -410,9 +413,15 @@ minimax-m2-proxy/
 │   ├── openai.py            # OpenAI format generator
 │   └── anthropic.py         # Anthropic format generator
 ├── tests/
-│   ├── test_parsers.py      # Unit tests (16 tests)
-│   ├── test_tool_calling.py # E2E tests (5 comprehensive tests)
-│   └── e2e_test.py          # Legacy E2E tests
+│   ├── conftest.py                  # Shared pytest fixtures (stubbed Tabby client)
+│   ├── unit/
+│   │   ├── test_reasoning.py        # Reasoning helpers and think splitting
+│   │   ├── test_session_store.py    # History repair logic
+│   │   └── test_streaming_parser.py # Streaming parser behaviour
+│   └── integration/
+│       ├── test_anthropic_completion.py
+│       ├── test_openai_completion.py
+│       └── test_openai_stream.py
 ├── requirements.txt         # Python dependencies
 ├── .env.example             # Configuration template
 ├── minimax-m2-proxy.service # systemd service file

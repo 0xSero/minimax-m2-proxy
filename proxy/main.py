@@ -6,24 +6,25 @@ Dual-API proxy supporting both OpenAI and Anthropic formats
 import json
 import logging
 from contextlib import asynccontextmanager
-from typing import AsyncIterator
+from typing import Any, AsyncIterator, Dict, List, Optional
 
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import StreamingResponse, JSONResponse
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse, StreamingResponse
 
-from .config import settings
 from .client import TabbyClient
+from .config import settings
 from .models import (
-    OpenAIChatRequest,
     AnthropicChatRequest,
+    OpenAIChatRequest,
+    anthropic_messages_to_openai,
     anthropic_tools_to_openai,
-    anthropic_messages_to_openai
 )
-from parsers.tools import parse_tool_calls
-from parsers.streaming import StreamingParser
-from parsers.reasoning import ensure_think_wrapped
-from formatters.openai import OpenAIFormatter
 from formatters.anthropic import AnthropicFormatter
+from formatters.openai import OpenAIFormatter
+from parsers.reasoning import ensure_think_wrapped, split_think
+from parsers.streaming import StreamingParser
+from parsers.tools import parse_tool_calls
+from .session_store import RepairResult, session_store
 
 
 # Setup logging
@@ -50,6 +51,64 @@ else:
 tabby_client: TabbyClient = None
 openai_formatter = OpenAIFormatter()
 anthropic_formatter = AnthropicFormatter()
+
+
+def require_auth(raw_request: Request) -> None:
+    """Enforce bearer auth when configured."""
+    if not settings.auth_api_key:
+        return
+
+    auth_header = raw_request.headers.get("Authorization")
+    if not auth_header or not auth_header.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Missing bearer token")
+
+    token = auth_header.split(" ", 1)[1].strip()
+    if token != settings.auth_api_key:
+        raise HTTPException(status_code=401, detail="Invalid bearer token")
+
+
+def extract_session_id(raw_request: Request, extra_body: Optional[Dict[str, Any]] = None) -> Optional[str]:
+    """Extract session identifier from headers, query params, or request body."""
+    header_session = raw_request.headers.get("X-Session-Id")
+    if header_session:
+        return header_session.strip()
+
+    query_session = raw_request.query_params.get("conversation_id")
+    if query_session:
+        return query_session.strip()
+
+    if extra_body and isinstance(extra_body, dict):
+        body_session = extra_body.get("conversation_id")
+        if isinstance(body_session, str) and body_session.strip():
+            return body_session.strip()
+
+    return None
+
+
+def normalize_openai_history(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Normalize assistant messages so Tabby receives inline <think> content."""
+    normalized: List[Dict[str, Any]] = []
+    for message in messages:
+        msg_copy = dict(message)
+        if msg_copy.get("role") == "assistant":
+            reasoning_details = msg_copy.pop("reasoning_details", None)
+            reasoning_text = ""
+            if isinstance(reasoning_details, list):
+                for detail in reasoning_details:
+                    if isinstance(detail, dict):
+                        reasoning_text += str(detail.get("text", ""))
+
+            content = msg_copy.get("content") or ""
+            if reasoning_text:
+                reason_block = f"<think>{reasoning_text}</think>"
+                if content and not content.startswith("\n"):
+                    reason_block = f"{reason_block}\n"
+                msg_copy["content"] = reason_block + content
+            elif content and "</think>" in content:
+                msg_copy["content"] = ensure_think_wrapped(content)
+
+        normalized.append(msg_copy)
+    return normalized
 
 
 @asynccontextmanager
@@ -89,17 +148,23 @@ app = FastAPI(
 # ============================================================================
 
 @app.post("/v1/chat/completions")
-async def openai_chat_completions(request: OpenAIChatRequest):
+async def openai_chat_completions(chat_request: OpenAIChatRequest, raw_request: Request):
     """OpenAI-compatible chat completions endpoint"""
 
     try:
-        if request.stream:
+        require_auth(raw_request)
+        session_id = extract_session_id(raw_request, chat_request.extra_body)
+
+        if chat_request.n is not None and chat_request.n != 1:
+            raise HTTPException(status_code=400, detail="Only n=1 is supported")
+
+        if chat_request.stream:
             return StreamingResponse(
-                stream_openai_response(request),
+                stream_openai_response(chat_request, session_id),
                 media_type="text/event-stream"
             )
         else:
-            return await complete_openai_response(request)
+            return await complete_openai_response(chat_request, session_id)
 
     except Exception as e:
         logger.error(f"Error in OpenAI endpoint: {e}", exc_info=True)
@@ -109,31 +174,50 @@ async def openai_chat_completions(request: OpenAIChatRequest):
         )
 
 
-async def complete_openai_response(request: OpenAIChatRequest) -> dict:
+async def complete_openai_response(chat_request: OpenAIChatRequest, session_id: Optional[str]) -> dict:
     """Handle non-streaming OpenAI request"""
 
     # Convert messages to dict
-    messages = [msg.model_dump(exclude_none=True) for msg in request.messages]
+    messages = [msg.model_dump(exclude_none=True) for msg in chat_request.messages]
+
+    repair_result: RepairResult = session_store.inject_or_repair(
+        messages,
+        session_id,
+        require_session=settings.require_session_for_repair,
+    )
+    if repair_result.repaired:
+        logger.info(
+            "Session history repaired (OpenAI)",
+            extra={"session_id": session_id, **repair_result.to_log_dict()},
+        )
+    elif repair_result.skip_reason:
+        logger.debug(
+            "Session repair skipped",
+            extra={"session_id": session_id, **repair_result.to_log_dict()},
+        )
+
+    messages = repair_result.messages
+    normalized_messages = normalize_openai_history(messages)
 
     # Convert tools if present
     tools = None
-    if request.tools:
-        tools = [tool.model_dump(exclude_none=True) for tool in request.tools]
+    if chat_request.tools:
+        tools = [tool.model_dump(exclude_none=True) for tool in chat_request.tools]
 
     # Call TabbyAPI
     banned_strings = settings.banned_chinese_strings if settings.enable_chinese_char_blocking else None
     logger.info(f"Calling TabbyAPI with banned_strings enabled: {settings.enable_chinese_char_blocking}, count: {len(banned_strings) if banned_strings else 0}")
 
     response = await tabby_client.chat_completion(
-        messages=messages,
-        model=request.model,
-        max_tokens=request.max_tokens,
-        temperature=request.temperature,
-        top_p=request.top_p,
-        top_k=request.top_k,
-        stop=request.stop,
+        messages=normalized_messages,
+        model=chat_request.model,
+        max_tokens=chat_request.max_tokens,
+        temperature=chat_request.temperature,
+        top_p=chat_request.top_p,
+        top_k=chat_request.top_k,
+        stop=chat_request.stop,
         tools=tools,
-        tool_choice=request.tool_choice,
+        tool_choice=chat_request.tool_choice,
         add_generation_prompt=True,  # Required for <think> tags
         banned_strings=banned_strings
     )
@@ -152,42 +236,98 @@ async def complete_openai_response(request: OpenAIChatRequest) -> dict:
 
     # Use parsed content if tool calls were found, otherwise use raw content
     content_payload = result["content"] if result["tools_called"] else raw_content
-
-    # Format response
-    return openai_formatter.format_complete_response(
-        content=content_payload,
-        tool_calls=result["tool_calls"] if result["tools_called"] else None,
-        model=request.model
+    reasoning_split = (
+        settings.enable_reasoning_split
+        and bool(chat_request.extra_body and chat_request.extra_body.get("reasoning_split"))
     )
 
+    thinking_text = ""
+    visible_content = content_payload
 
-async def stream_openai_response(request: OpenAIChatRequest) -> AsyncIterator[str]:
+    if reasoning_split:
+        wrapped_content = ensure_think_wrapped(raw_content)
+        thinking_text, visible_content = split_think(wrapped_content)
+
+    client_content = visible_content if reasoning_split else content_payload
+
+    formatted = openai_formatter.format_complete_response(
+        content=client_content,
+        tool_calls=result["tool_calls"] if result["tools_called"] else None,
+        model=chat_request.model,
+        reasoning_text=thinking_text if reasoning_split else None,
+    )
+
+    if session_id:
+        assistant_message = {
+            "role": "assistant",
+            "content": ensure_think_wrapped(raw_content),
+        }
+        if result["tools_called"]:
+            assistant_message["tool_calls"] = result["tool_calls"]
+        if reasoning_split and thinking_text:
+            assistant_message["reasoning_details"] = [
+                {"type": "chain_of_thought", "text": thinking_text}
+            ]
+        session_store.append_message(session_id, assistant_message)
+
+    return formatted
+
+
+async def stream_openai_response(chat_request: OpenAIChatRequest, session_id: Optional[str]) -> AsyncIterator[str]:
     """Handle streaming OpenAI request"""
 
     # Convert messages to dict
-    messages = [msg.model_dump(exclude_none=True) for msg in request.messages]
+    messages = [msg.model_dump(exclude_none=True) for msg in chat_request.messages]
+
+    repair_result: RepairResult = session_store.inject_or_repair(
+        messages,
+        session_id,
+        require_session=settings.require_session_for_repair,
+    )
+    if repair_result.repaired:
+        logger.info(
+            "Session history repaired (OpenAI/stream)",
+            extra={"session_id": session_id, **repair_result.to_log_dict()},
+        )
+    elif repair_result.skip_reason:
+        logger.debug(
+            "Session repair skipped",
+            extra={"session_id": session_id, **repair_result.to_log_dict()},
+        )
+
+    messages = repair_result.messages
+    normalized_messages = normalize_openai_history(messages)
 
     # Convert tools if present
     tools = None
-    if request.tools:
-        tools = [tool.model_dump(exclude_none=True) for tool in request.tools]
+    if chat_request.tools:
+        tools = [tool.model_dump(exclude_none=True) for tool in chat_request.tools]
 
     # Initialize streaming parser
     streaming_parser = StreamingParser()
     streaming_parser.set_tools(tools)
+    raw_segments: List[str] = []
+    visible_segments: List[str] = []
+    reasoning_segments: List[str] = []
+    captured_tool_calls: Optional[List[Dict[str, Any]]] = None
+
+    reasoning_split = (
+        settings.enable_reasoning_split
+        and bool(chat_request.extra_body and chat_request.extra_body.get("reasoning_split"))
+    )
 
     try:
         # Stream from TabbyAPI
         async for chunk in tabby_client.extract_streaming_content(
-            messages=messages,
-            model=request.model,
-            max_tokens=request.max_tokens,
-            temperature=request.temperature,
-            top_p=request.top_p,
-            top_k=request.top_k,
-            stop=request.stop,
+            messages=normalized_messages,
+            model=chat_request.model,
+            max_tokens=chat_request.max_tokens,
+            temperature=chat_request.temperature,
+            top_p=chat_request.top_p,
+            top_k=chat_request.top_k,
+            stop=chat_request.stop,
             tools=tools,
-            tool_choice=request.tool_choice,
+            tool_choice=chat_request.tool_choice,
             add_generation_prompt=True,  # Required for <think> tags
             banned_strings=settings.banned_chinese_strings if settings.enable_chinese_char_blocking else None
         ):
@@ -203,31 +343,121 @@ async def stream_openai_response(request: OpenAIChatRequest) -> AsyncIterator[st
                     parsed = streaming_parser.process_chunk(content_delta)
 
                     if parsed:
+                        reasoning_delta = parsed.get("reasoning_delta")
+                        if reasoning_delta:
+                            reasoning_segments.append(reasoning_delta)
+
                         if parsed["type"] == "content":
-                            # Send content delta (includes <think> blocks)
-                            yield openai_formatter.format_streaming_chunk(delta=parsed["delta"], model=request.model)
+                            raw_delta = parsed.get("raw_delta") or ""
+                            visible_delta = parsed.get("content_delta") or ""
+                            if raw_delta:
+                                raw_segments.append(raw_delta)
+                            if visible_delta:
+                                visible_segments.append(visible_delta)
+
+                            delta_for_client = raw_delta
+                            if reasoning_split:
+                                delta_for_client = visible_delta or ""
+
+                            if delta_for_client or (reasoning_split and reasoning_delta):
+                                yield openai_formatter.format_streaming_chunk(
+                                    delta=delta_for_client or None,
+                                    reasoning_delta=reasoning_delta if reasoning_split else None,
+                                    model=chat_request.model,
+                                )
 
                         elif parsed["type"] == "tool_calls":
-                            # Send tool calls as compliant streaming deltas
+                            captured_tool_calls = parsed["tool_calls"]
+                            if reasoning_split and reasoning_delta:
+                                yield openai_formatter.format_streaming_chunk(
+                                    reasoning_delta=reasoning_delta,
+                                    model=chat_request.model,
+                                )
                             for idx, tool_call in enumerate(parsed["tool_calls"]):
-                                for tool_chunk in openai_formatter.format_tool_call_stream(tool_call, idx, model=request.model):
+                                for tool_chunk in openai_formatter.format_tool_call_stream(
+                                    tool_call, idx, model=chat_request.model
+                                ):
                                     yield tool_chunk
+
+                        elif parsed["type"] == "reasoning":
+                            if reasoning_split and reasoning_delta:
+                                yield openai_formatter.format_streaming_chunk(
+                                    reasoning_delta=reasoning_delta,
+                                    model=chat_request.model,
+                                )
 
                 # Check for finish
                 finish_reason = choice.get("finish_reason")
                 if finish_reason:
                     pending_tail = streaming_parser.flush_pending()
                     if pending_tail:
-                        yield openai_formatter.format_streaming_chunk(delta=pending_tail, model=request.model)
+                        raw_delta = pending_tail.get("raw_delta") or ""
+                        visible_delta = pending_tail.get("content_delta") or ""
+                        reasoning_delta = pending_tail.get("reasoning_delta")
+
+                        if raw_delta:
+                            raw_segments.append(raw_delta)
+                        if visible_delta:
+                            visible_segments.append(visible_delta)
+                        if reasoning_delta:
+                            reasoning_segments.append(reasoning_delta)
+
+                        delta_for_client = raw_delta
+                        if reasoning_split:
+                            delta_for_client = visible_delta or ""
+
+                        if delta_for_client or (reasoning_split and reasoning_delta):
+                            yield openai_formatter.format_streaming_chunk(
+                                delta=delta_for_client or None,
+                                reasoning_delta=reasoning_delta if reasoning_split else None,
+                                model=chat_request.model,
+                            )
                     # Override finish_reason if tool calls were detected
                     if finish_reason == "stop" and streaming_parser.has_tool_calls():
                         finish_reason = "tool_calls"
-                    yield openai_formatter.format_streaming_chunk(finish_reason=finish_reason, model=request.model)
+                    yield openai_formatter.format_streaming_chunk(finish_reason=finish_reason, model=chat_request.model)
 
         # Send done
         pending_tail = streaming_parser.flush_pending()
         if pending_tail:
-            yield openai_formatter.format_streaming_chunk(delta=pending_tail, model=request.model)
+            raw_delta = pending_tail.get("raw_delta") or ""
+            visible_delta = pending_tail.get("content_delta") or ""
+            reasoning_delta = pending_tail.get("reasoning_delta")
+
+            if raw_delta:
+                raw_segments.append(raw_delta)
+            if visible_delta:
+                visible_segments.append(visible_delta)
+            if reasoning_delta:
+                reasoning_segments.append(reasoning_delta)
+
+            delta_for_client = raw_delta
+            if reasoning_split:
+                delta_for_client = visible_delta or ""
+
+            if delta_for_client or (reasoning_split and reasoning_delta):
+                yield openai_formatter.format_streaming_chunk(
+                    delta=delta_for_client or None,
+                    reasoning_delta=reasoning_delta if reasoning_split else None,
+                    model=chat_request.model,
+                )
+
+        final_raw_content = "".join(raw_segments) if raw_segments else streaming_parser.get_final_content()
+        final_reasoning = "".join(reasoning_segments)
+        captured_tool_calls = captured_tool_calls or streaming_parser.get_last_tool_calls()
+        if session_id:
+            assistant_message: Dict[str, Any] = {
+                "role": "assistant",
+                "content": ensure_think_wrapped(final_raw_content),
+            }
+            if captured_tool_calls:
+                assistant_message["tool_calls"] = captured_tool_calls
+            if reasoning_split and final_reasoning:
+                assistant_message["reasoning_details"] = [
+                    {"type": "chain_of_thought", "text": final_reasoning}
+                ]
+            session_store.append_message(session_id, assistant_message)
+
         yield openai_formatter.format_streaming_done()
 
     except Exception as e:
@@ -241,17 +471,20 @@ async def stream_openai_response(request: OpenAIChatRequest) -> AsyncIterator[st
 # ============================================================================
 
 @app.post("/v1/messages")
-async def anthropic_messages(request: AnthropicChatRequest):
+async def anthropic_messages(anthropic_request: AnthropicChatRequest, raw_request: Request):
     """Anthropic-compatible messages endpoint"""
 
     try:
-        if request.stream:
+        require_auth(raw_request)
+        session_id = extract_session_id(raw_request)
+
+        if anthropic_request.stream:
             return StreamingResponse(
-                stream_anthropic_response(request),
+                stream_anthropic_response(anthropic_request, session_id),
                 media_type="text/event-stream"
             )
         else:
-            return await complete_anthropic_response(request)
+            return await complete_anthropic_response(anthropic_request, session_id)
 
     except Exception as e:
         logger.error(f"Error in Anthropic endpoint: {e}", exc_info=True)
@@ -261,19 +494,38 @@ async def anthropic_messages(request: AnthropicChatRequest):
         )
 
 
-async def complete_anthropic_response(request: AnthropicChatRequest) -> dict:
+async def complete_anthropic_response(anthropic_request: AnthropicChatRequest, session_id: Optional[str]) -> dict:
     """Handle non-streaming Anthropic request"""
 
     # Convert Anthropic format to OpenAI format
-    openai_messages = anthropic_messages_to_openai(request.messages)
+    openai_messages = anthropic_messages_to_openai(anthropic_request.messages)
 
     # Add system message if present
-    if request.system:
-        system_content = request.system if isinstance(request.system, str) else str(request.system)
+    if anthropic_request.system:
+        system_content = anthropic_request.system if isinstance(anthropic_request.system, str) else str(anthropic_request.system)
         openai_messages.insert(0, {"role": "system", "content": system_content})
 
+    repair_result: RepairResult = session_store.inject_or_repair(
+        openai_messages,
+        session_id,
+        require_session=settings.require_session_for_repair,
+    )
+    if repair_result.repaired:
+        logger.info(
+            "Session history repaired (Anthropic)",
+            extra={"session_id": session_id, **repair_result.to_log_dict()},
+        )
+    elif repair_result.skip_reason:
+        logger.debug(
+            "Session repair skipped",
+            extra={"session_id": session_id, **repair_result.to_log_dict()},
+        )
+
+    openai_messages = repair_result.messages
+    normalized_messages = normalize_openai_history(openai_messages)
+
     # Convert tools
-    tools = anthropic_tools_to_openai(request.tools)
+    tools = anthropic_tools_to_openai(anthropic_request.tools)
 
     # Debug logging
     import pprint
@@ -283,15 +535,15 @@ async def complete_anthropic_response(request: AnthropicChatRequest) -> dict:
 
     # Call TabbyAPI
     response = await tabby_client.chat_completion(
-        messages=openai_messages,
-        model=request.model,
-        max_tokens=request.max_tokens,
-        temperature=request.temperature,
-        top_p=request.top_p,
-        top_k=request.top_k,
-        stop=request.stop_sequences,
+        messages=normalized_messages,
+        model=anthropic_request.model,
+        max_tokens=anthropic_request.max_tokens,
+        temperature=anthropic_request.temperature,
+        top_p=anthropic_request.top_p,
+        top_k=anthropic_request.top_k,
+        stop=anthropic_request.stop_sequences,
         tools=tools,
-        tool_choice=request.tool_choice,
+        tool_choice=anthropic_request.tool_choice,
         add_generation_prompt=True,  # Required for <think> tags
         banned_strings=settings.banned_chinese_strings if settings.enable_chinese_char_blocking else None
     )
@@ -299,42 +551,84 @@ async def complete_anthropic_response(request: AnthropicChatRequest) -> dict:
     if settings.log_raw_responses:
         logger.debug(f"Raw TabbyAPI response: {response}")
 
-    # Extract raw content (contains XML and <think> blocks)
     raw_content = response["choices"][0]["message"].get("content", "")
-    raw_content = ensure_think_wrapped(raw_content)
+    wrapped_raw_content = ensure_think_wrapped(raw_content)
 
     # Parse tool calls
-    result = parse_tool_calls(raw_content, tools)
+    result = parse_tool_calls(wrapped_raw_content, tools)
+
+    content_source = result["content"] if result["tools_called"] else wrapped_raw_content
+    content_source = ensure_think_wrapped(content_source) if content_source else ""
+
+    thinking_text = ""
+    visible_text = content_source
+    if settings.enable_anthropic_thinking_blocks:
+        thinking_text, visible_text = split_think(content_source)
+    else:
+        visible_text = content_source
 
     # Format as Anthropic response
-    return anthropic_formatter.format_complete_response(
-        content=result["content"] if result["tools_called"] else raw_content,
+    formatted = anthropic_formatter.format_complete_response(
+        content=visible_text,
         tool_calls=result["tool_calls"] if result["tools_called"] else None,
-        model=request.model
+        model=anthropic_request.model,
+        thinking_text=thinking_text if settings.enable_anthropic_thinking_blocks else None,
     )
 
+    if session_id:
+        assistant_message: Dict[str, Any] = {
+            "role": "assistant",
+            "content": wrapped_raw_content,
+        }
+        if result["tools_called"]:
+            assistant_message["tool_calls"] = result["tool_calls"]
+        session_store.append_message(session_id, assistant_message)
 
-async def stream_anthropic_response(request: AnthropicChatRequest) -> AsyncIterator[str]:
+    return formatted
+
+
+async def stream_anthropic_response(anthropic_request: AnthropicChatRequest, session_id: Optional[str]) -> AsyncIterator[str]:
     """Handle streaming Anthropic request"""
 
     # Convert Anthropic format to OpenAI format
-    openai_messages = anthropic_messages_to_openai(request.messages)
+    openai_messages = anthropic_messages_to_openai(anthropic_request.messages)
 
     # Add system message if present
-    if request.system:
-        system_content = request.system if isinstance(request.system, str) else str(request.system)
+    if anthropic_request.system:
+        system_content = anthropic_request.system if isinstance(anthropic_request.system, str) else str(anthropic_request.system)
         openai_messages.insert(0, {"role": "system", "content": system_content})
 
+    repair_result: RepairResult = session_store.inject_or_repair(
+        openai_messages,
+        session_id,
+        require_session=settings.require_session_for_repair,
+    )
+    if repair_result.repaired:
+        logger.info(
+            "Session history repaired (Anthropic/stream)",
+            extra={"session_id": session_id, **repair_result.to_log_dict()},
+        )
+    elif repair_result.skip_reason:
+        logger.debug(
+            "Session repair skipped",
+            extra={"session_id": session_id, **repair_result.to_log_dict()},
+        )
+
+    openai_messages = repair_result.messages
+    normalized_messages = normalize_openai_history(openai_messages)
+
     # Convert tools
-    tools = anthropic_tools_to_openai(request.tools)
+    tools = anthropic_tools_to_openai(anthropic_request.tools)
 
     # Initialize streaming parser
     streaming_parser = StreamingParser()
     streaming_parser.set_tools(tools)
+    captured_tool_calls: Optional[list[Dict[str, Any]]] = None
+    thinking_block_started = False
 
     try:
         # Send message_start
-        yield anthropic_formatter.format_message_start(request.model)
+        yield anthropic_formatter.format_message_start(anthropic_request.model)
 
         # Start first content block
         content_block_index = 0
@@ -342,15 +636,15 @@ async def stream_anthropic_response(request: AnthropicChatRequest) -> AsyncItera
 
         # Stream from TabbyAPI
         async for chunk in tabby_client.extract_streaming_content(
-            messages=openai_messages,
-            model=request.model,
-            max_tokens=request.max_tokens,
-            temperature=request.temperature,
-            top_p=request.top_p,
-            top_k=request.top_k,
-            stop=request.stop_sequences,
+            messages=normalized_messages,
+            model=anthropic_request.model,
+            max_tokens=anthropic_request.max_tokens,
+            temperature=anthropic_request.temperature,
+            top_p=anthropic_request.top_p,
+            top_k=anthropic_request.top_k,
+            stop=anthropic_request.stop_sequences,
             tools=tools,
-            tool_choice=request.tool_choice,
+            tool_choice=anthropic_request.tool_choice,
             add_generation_prompt=True,  # Required for <think> tags
             banned_strings=settings.banned_chinese_strings if settings.enable_chinese_char_blocking else None
         ):
@@ -366,17 +660,34 @@ async def stream_anthropic_response(request: AnthropicChatRequest) -> AsyncItera
                     parsed = streaming_parser.process_chunk(content_delta)
 
                     if parsed:
+                        reasoning_delta = parsed.get("reasoning_delta")
+                        if reasoning_delta and settings.enable_anthropic_thinking_blocks:
+                            if not thinking_block_started:
+                                yield anthropic_formatter.format_content_block_start(content_block_index, "thinking")
+                                thinking_block_started = True
+                            yield anthropic_formatter.format_content_block_delta(
+                                content_block_index,
+                                reasoning_delta,
+                                delta_type="thinking_delta",
+                            )
+
                         if parsed["type"] == "content":
                             # Start text block if not started
                             if not content_block_started:
+                                if thinking_block_started and settings.enable_anthropic_thinking_blocks:
+                                    yield anthropic_formatter.format_content_block_stop(content_block_index)
+                                    content_block_index += 1
+                                    thinking_block_started = False
                                 yield anthropic_formatter.format_content_block_start(content_block_index, "text")
                                 content_block_started = True
 
-                            # Send content delta (includes <think> blocks)
-                            yield anthropic_formatter.format_content_block_delta(
-                                content_block_index,
-                                parsed["delta"]
-                            )
+                            delta_payload = parsed.get("raw_delta") if not settings.enable_anthropic_thinking_blocks else parsed.get("content_delta")
+                            if delta_payload:
+                                yield anthropic_formatter.format_content_block_delta(
+                                    content_block_index,
+                                    delta_payload,
+                                    delta_type="text_delta"
+                                )
 
                         elif parsed["type"] == "tool_calls":
                             # Close text block if open
@@ -384,8 +695,13 @@ async def stream_anthropic_response(request: AnthropicChatRequest) -> AsyncItera
                                 yield anthropic_formatter.format_content_block_stop(content_block_index)
                                 content_block_index += 1
                                 content_block_started = False
+                            if thinking_block_started:
+                                yield anthropic_formatter.format_content_block_stop(content_block_index)
+                                content_block_index += 1
+                                thinking_block_started = False
 
                             # Send tool use blocks
+                            captured_tool_calls = parsed["tool_calls"]
                             for tool_call in parsed["tool_calls"]:
                                 yield anthropic_formatter.format_tool_use_delta(content_block_index, tool_call)
                                 yield anthropic_formatter.format_content_block_stop(content_block_index)
@@ -410,7 +726,16 @@ async def stream_anthropic_response(request: AnthropicChatRequest) -> AsyncItera
                     yield anthropic_formatter.format_message_delta(stop_reason)
 
         # Send message_stop
+        if thinking_block_started:
+            yield anthropic_formatter.format_content_block_stop(content_block_index)
         yield anthropic_formatter.format_message_stop()
+
+        if session_id:
+            final_content = ensure_think_wrapped(streaming_parser.get_final_content())
+            assistant_message: Dict[str, Any] = {"role": "assistant", "content": final_content}
+            if captured_tool_calls:
+                assistant_message["tool_calls"] = captured_tool_calls
+            session_store.append_message(session_id, assistant_message)
 
     except Exception as e:
         logger.error(f"Error in Anthropic streaming: {e}", exc_info=True)

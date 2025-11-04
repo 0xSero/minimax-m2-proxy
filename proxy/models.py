@@ -10,6 +10,7 @@ class OpenAIMessage(BaseModel):
     role: Literal["system", "user", "assistant", "tool"]
     content: Optional[Union[str, List[Dict[str, Any]]]] = None
     tool_calls: Optional[List[Dict[str, Any]]] = None
+    reasoning_details: Optional[List[Dict[str, Any]]] = None
     tool_call_id: Optional[str] = None
     name: Optional[str] = None
 
@@ -43,20 +44,23 @@ class OpenAIChatRequest(BaseModel):
     model: str = "minimax-m2"
     messages: List[OpenAIMessage]
     max_tokens: Optional[int] = Field(None, ge=1)
-    temperature: Optional[float] = Field(1.0, ge=0.0, le=2.0)
+    temperature: Optional[float] = Field(1.0, gt=0.0, le=1.0)
     top_p: Optional[float] = Field(1.0, ge=0.0, le=1.0)
     top_k: Optional[int] = Field(None, ge=0)
+    n: Optional[int] = Field(1, ge=1)
     stream: bool = False
     stop: Optional[Union[str, List[str]]] = None
     tools: Optional[List[OpenAITool]] = None
     tool_choice: Optional[Union[str, Dict[str, Any]]] = None
+    extra_body: Optional[Dict[str, Any]] = None
 
 
 # Anthropic Models
 class AnthropicContentBlock(BaseModel):
     """Anthropic content block"""
-    type: Literal["text", "image", "tool_use", "tool_result"]
+    type: Literal["text", "image", "tool_use", "tool_result", "thinking"]
     text: Optional[str] = None
+    thinking: Optional[str] = None
     source: Optional[Dict[str, Any]] = None  # For image
     id: Optional[str] = None  # For tool_use
     name: Optional[str] = None  # For tool_use
@@ -84,7 +88,7 @@ class AnthropicChatRequest(BaseModel):
     messages: List[AnthropicMessage]
     max_tokens: int = Field(4096, ge=1)
     system: Optional[Union[str, List[Dict[str, Any]]]] = None
-    temperature: Optional[float] = Field(1.0, ge=0.0, le=1.0)
+    temperature: Optional[float] = Field(1.0, gt=0.0, le=1.0)
     top_p: Optional[float] = Field(None, ge=0.0, le=1.0)
     top_k: Optional[int] = Field(None, ge=0)
     stream: bool = False

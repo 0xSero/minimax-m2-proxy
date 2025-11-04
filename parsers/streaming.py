@@ -1,135 +1,189 @@
-"""Simple streaming parser for MiniMax-M2 responses
+"""Simple streaming parser for MiniMax-M2 responses."""
 
-Strategy: Stream content immediately until tool calls are detected,
-then buffer until complete, parse, and continue.
+from typing import Any, Dict, List, Optional
 
-Critical: TabbyAPI's chat template puts <think> in generation prompt,
-so model outputs "</think>" without opening tag. We add it at stream start
-when we detect </think> exists.
-"""
-
-from typing import Dict, Any, Optional, List
+from .reasoning import split_think
 from .tools import parse_tool_calls
 
 
 class StreamingParser:
-    """Simple buffering parser for streaming responses"""
+    """Simple buffering parser for streaming responses."""
 
-    def __init__(self):
+    def __init__(self) -> None:
         self.buffer = ""
-        self.sent_position = 0  # How much we've already sent
+        self.sent_position = 0  # How much raw content we've already emitted
         self.tools_sent = False
-        self.tools = None
+        self.tools: Optional[List[Dict[str, Any]]] = None
         self.think_status_determined = False  # Have we determined if </think> will appear?
         self.has_think_closing = False  # Will </think> appear in response?
         self.think_opening_sent = False  # Have we sent <think> opening?
+        self.reasoning_len_sent = 0  # Number of reasoning characters already emitted
+        self.last_tool_calls: Optional[List[Dict[str, Any]]] = None
 
-    def set_tools(self, tools: Optional[List[Dict]]):
-        """Set tools for type conversion during parsing"""
+    def set_tools(self, tools: Optional[List[Dict[str, Any]]]) -> None:
+        """Set tools for type conversion during parsing."""
         self.tools = tools
 
     def has_tool_calls(self) -> bool:
-        """Check if tool calls were detected"""
+        """Check if tool calls were detected."""
         return self.tools_sent
+
+    def _compute_reasoning_delta(self) -> str:
+        """Return incremental reasoning text (inside <think>...</think>)."""
+        if "</think>" not in self.buffer and "<think>" not in self.buffer:
+            return ""
+
+        closing_idx = self.buffer.find("</think>")
+        if closing_idx == -1:
+            # Think block still streaming; avoid emitting until we know it exists
+            return ""
+
+        reasoning_segment = self.buffer[:closing_idx]
+        if reasoning_segment.startswith("<think>"):
+            reasoning_segment = reasoning_segment[len("<think>") :]
+
+        if len(reasoning_segment) <= self.reasoning_len_sent:
+            return ""
+
+        delta = reasoning_segment[self.reasoning_len_sent :]
+        self.reasoning_len_sent = len(reasoning_segment)
+        return delta
 
     def process_chunk(self, chunk: str) -> Optional[Dict[str, Any]]:
         """
-        Process incoming chunk.
+        Process incoming chunk and return delta information.
 
-        Returns:
-            - {"type": "content", "delta": str} for content
-            - {"type": "tool_calls", "tool_calls": [...]} for tool calls
-            - None if no output to send yet
+        Returns dict with keys:
+            - type: "content" or "tool_calls" or "reasoning"
+            - raw_delta: Raw text delta (with <think> tags) when applicable
+            - content_delta: Visible text delta (outside <think>)
+            - reasoning_delta: Reasoning text delta
+            - tool_calls: Parsed tool call payload when available
         """
         self.buffer += chunk
+        reasoning_delta = self._compute_reasoning_delta()
 
-        # Check if think status is determined
-        # We MUST wait until we see </think> OR a tool call starts to know if we need <think> opening
+        # Determine think status before emitting content
         if not self.think_status_determined:
             if "</think>" in self.buffer:
                 self.think_status_determined = True
                 self.has_think_closing = True
             elif "<minimax:tool_call>" in self.buffer:
-                # Tool call started without seeing </think> - no think block in this response
                 self.think_status_determined = True
                 self.has_think_closing = False
             else:
-                # Haven't determined yet - buffer more
+                # Still waiting for confirmation; only emit reasoning if available
+                if reasoning_delta:
+                    return {"type": "reasoning", "reasoning_delta": reasoning_delta}
                 return None
 
-        # Check if we're inside a tool call block
         has_start = "<minimax:tool_call>" in self.buffer
         has_end = "</minimax:tool_call>" in self.buffer
 
         if has_start and not has_end:
-            # Tool call started but not finished - send content before tool call, then pause
             if not self.tools_sent:
                 tool_start_idx = self.buffer.find("<minimax:tool_call>")
                 content_before = self.buffer[:tool_start_idx]
 
                 if len(content_before) > self.sent_position:
-                    delta = content_before[self.sent_position:]
-                    # Prepend <think> tag if this is first send and </think> exists
+                    delta = content_before[self.sent_position :]
                     if self.sent_position == 0 and not self.think_opening_sent and self.has_think_closing:
                         self.think_opening_sent = True
                         delta = "<think>\n" + delta
                     self.sent_position = len(content_before)
-                    return {"type": "content", "delta": delta}
+                    think_text, visible_text = split_think(delta)
+                    result: Dict[str, Any] = {
+                        "type": "content",
+                        "raw_delta": delta,
+                        "content_delta": visible_text or None,
+                    }
+                    aggregate_reasoning = reasoning_delta or think_text
+                    if aggregate_reasoning:
+                        result["reasoning_delta"] = aggregate_reasoning
+                    return result
 
-            # Pause - waiting for tool call to complete
-            return None
+            return {"type": "reasoning", "reasoning_delta": reasoning_delta} if reasoning_delta else None
 
         if has_start and has_end and not self.tools_sent:
-            # Complete tool call - parse and send
             result = parse_tool_calls(self.buffer, self.tools)
 
             if result["tools_called"]:
                 self.tools_sent = True
+                self.last_tool_calls = result["tool_calls"]
 
-                # Send any remaining content before tool call (if we haven't already)
                 tool_start_idx = self.buffer.find("<minimax:tool_call>")
                 content_before = self.buffer[:tool_start_idx]
 
                 if len(content_before) > self.sent_position:
-                    # Still have content to send before tool call
-                    delta = content_before[self.sent_position:]
-                    # Prepend <think> tag if this is first send and </think> exists
+                    delta = content_before[self.sent_position :]
                     if self.sent_position == 0 and not self.think_opening_sent and self.has_think_closing:
                         self.think_opening_sent = True
                         delta = "<think>\n" + delta
                     self.sent_position = tool_start_idx
-                    return {"type": "content", "delta": delta}
+                    think_text, visible_text = split_think(delta)
+                    response: Dict[str, Any] = {
+                        "type": "content",
+                        "raw_delta": delta,
+                        "content_delta": visible_text or None,
+                    }
+                    aggregate_reasoning = reasoning_delta or think_text
+                    if aggregate_reasoning:
+                        response["reasoning_delta"] = aggregate_reasoning
+                    return response
 
-                # All content before tool call was already sent, now send tool calls
                 self.sent_position = len(self.buffer)
-                return {
+                payload: Dict[str, Any] = {
                     "type": "tool_calls",
-                    "tool_calls": result["tool_calls"]
+                    "tool_calls": result["tool_calls"],
                 }
+                if reasoning_delta:
+                    payload["reasoning_delta"] = reasoning_delta
+                return payload
 
-        # No tool call, or tool call already sent - stream content normally
         if len(self.buffer) > self.sent_position:
-            delta = self.buffer[self.sent_position:]
-            # Prepend <think> tag if this is first send and </think> exists
+            delta = self.buffer[self.sent_position :]
             if self.sent_position == 0 and not self.think_opening_sent and self.has_think_closing:
                 self.think_opening_sent = True
                 delta = "<think>\n" + delta
             self.sent_position = len(self.buffer)
-            return {"type": "content", "delta": delta}
+            think_text, visible_text = split_think(delta)
 
-        return None
+            result: Dict[str, Any] = {
+                "type": "content",
+                "raw_delta": delta,
+                "content_delta": visible_text or None,
+            }
 
-    def flush_pending(self) -> Optional[str]:
-        """Flush any remaining buffered content at stream end"""
+            aggregate_reasoning = reasoning_delta or think_text
+            if aggregate_reasoning:
+                result["reasoning_delta"] = aggregate_reasoning
+
+            return result
+
+        return {"type": "reasoning", "reasoning_delta": reasoning_delta} if reasoning_delta else None
+
+    def flush_pending(self) -> Optional[Dict[str, Any]]:
+        """Flush any remaining buffered content at stream end."""
         if len(self.buffer) > self.sent_position:
-            remaining = self.buffer[self.sent_position:]
+            remaining = self.buffer[self.sent_position :]
             self.sent_position = len(self.buffer)
-            return remaining
+            think_text, visible_text = split_think(remaining)
+            result: Dict[str, Any] = {
+                "raw_delta": remaining,
+                "content_delta": visible_text or None,
+            }
+            if think_text:
+                result["reasoning_delta"] = think_text
+            return result
         return None
 
     def get_final_content(self) -> str:
-        """Get complete final content with tool calls removed"""
+        """Get complete final content with tool calls removed."""
         if "<minimax:tool_call>" in self.buffer:
             result = parse_tool_calls(self.buffer, self.tools)
             return result.get("content") or ""
         return self.buffer
+
+    def get_last_tool_calls(self) -> Optional[List[Dict[str, Any]]]:
+        """Return the most recently parsed tool calls, if any."""
+        return self.last_tool_calls
