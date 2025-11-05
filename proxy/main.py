@@ -366,6 +366,14 @@ async def stream_openai_response(chat_request: OpenAIChatRequest, session_id: Op
                                     model=chat_request.model,
                                 )
 
+                            if parsed.get("tool_calls"):
+                                captured_tool_calls = parsed["tool_calls"]
+                                for idx, tool_call in enumerate(parsed["tool_calls"]):
+                                    for tool_chunk in openai_formatter.format_tool_call_stream(
+                                        tool_call, idx, model=chat_request.model
+                                    ):
+                                        yield tool_chunk
+
                         elif parsed["type"] == "tool_calls":
                             captured_tool_calls = parsed["tool_calls"]
                             if reasoning_split and reasoning_delta:
@@ -688,6 +696,21 @@ async def stream_anthropic_response(anthropic_request: AnthropicChatRequest, ses
                                     delta_payload,
                                     delta_type="text_delta"
                                 )
+
+                            if parsed.get("tool_calls"):
+                                captured_tool_calls = parsed["tool_calls"]
+                                if content_block_started:
+                                    yield anthropic_formatter.format_content_block_stop(content_block_index)
+                                    content_block_index += 1
+                                    content_block_started = False
+                                if thinking_block_started:
+                                    yield anthropic_formatter.format_content_block_stop(content_block_index)
+                                    content_block_index += 1
+                                    thinking_block_started = False
+                                for tool_call in parsed["tool_calls"]:
+                                    yield anthropic_formatter.format_tool_use_delta(content_block_index, tool_call)
+                                    yield anthropic_formatter.format_content_block_stop(content_block_index)
+                                    content_block_index += 1
 
                         elif parsed["type"] == "tool_calls":
                             # Close text block if open

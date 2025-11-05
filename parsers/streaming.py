@@ -129,6 +129,8 @@ class StreamingParser:
                     aggregate_reasoning = reasoning_delta or think_text
                     if aggregate_reasoning:
                         response["reasoning_delta"] = aggregate_reasoning
+                    if result["tool_calls"]:
+                        response["tool_calls"] = result["tool_calls"]
                     return response
 
                 self.sent_position = len(self.buffer)
