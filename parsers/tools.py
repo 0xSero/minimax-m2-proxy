@@ -7,11 +7,7 @@ https://platform.minimax.io/docs/guides/text-m2-function-call
 import json
 import re
 import uuid
-import warnings
 from typing import Any, Dict, List, Optional
-
-
-_DISALLOWED_CONTROL_CODES = {code for code in range(32)} - {9, 10, 13}
 
 
 def extract_name(name_str: str) -> str:
@@ -23,28 +19,6 @@ def extract_name(name_str: str) -> str:
     return name_str
 
 
-def _decode_string_value(value: str) -> str:
-    """Best-effort decoding of escaped sequences in string parameters."""
-    if "\\" not in value:
-        return value
-
-    # Suppress DeprecationWarning for unknown escape sequences while decoding.
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", category=DeprecationWarning)
-        try:
-            decoded = value.encode("utf-8").decode("unicode_escape")
-        except UnicodeDecodeError:
-            return value
-
-    if decoded == value:
-        return value
-
-    if any(ord(ch) in _DISALLOWED_CONTROL_CODES for ch in decoded):
-        return value
-
-    return decoded if decoded is not None else value
-
-
 def convert_param_value(value: str, param_type: str) -> Any:
     """Convert parameter value based on parameter type"""
     if value.lower() == "null":
@@ -53,8 +27,7 @@ def convert_param_value(value: str, param_type: str) -> Any:
     param_type = param_type.lower()
 
     if param_type in ["string", "str", "text"]:
-        decoded_value = _decode_string_value(value)
-        return decoded_value
+        return value
     elif param_type in ["integer", "int"]:
         try:
             return int(value)
