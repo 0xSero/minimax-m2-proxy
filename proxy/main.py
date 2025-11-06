@@ -23,7 +23,7 @@ from formatters.anthropic import AnthropicFormatter
 from formatters.openai import OpenAIFormatter
 from parsers.reasoning import ensure_think_wrapped, split_think
 from parsers.streaming import StreamingParser
-from parsers.tools import parse_tool_calls
+from parsers.tools import parse_tool_calls, tool_calls_to_minimax_xml
 from .session_store import RepairResult, session_store
 
 
@@ -225,34 +225,58 @@ async def complete_openai_response(chat_request: OpenAIChatRequest, session_id: 
     if settings.log_raw_responses:
         logger.debug(f"Raw TabbyAPI response: {response}")
 
-    # Extract raw content (contains XML and <think> blocks)
-    raw_content = response["choices"][0]["message"].get("content", "")
+    message_payload = response["choices"][0]["message"]
+    backend_content = message_payload.get("content", "") or ""
+    reasoning_text = message_payload.get("reasoning_content") or ""
+    backend_tool_calls = message_payload.get("tool_calls")
 
-    # Ensure think tags are wrapped (TabbyAPI includes closing but not opening tag)
+    sections: List[str] = []
+
+    if reasoning_text:
+        trimmed_reasoning = reasoning_text.rstrip()
+        sections.append(f"<think>{trimmed_reasoning}</think>")
+
+    if backend_content.strip():
+        sections.append(backend_content)
+
+    if backend_tool_calls:
+        xml_block = tool_calls_to_minimax_xml(backend_tool_calls)
+        if xml_block:
+            sections.append(xml_block)
+
+    raw_content = "\n\n".join(section for section in sections if section).strip()
+    if not raw_content:
+        raw_content = backend_content
+
     raw_content = ensure_think_wrapped(raw_content)
 
-    # Parse tool calls
+    # Parse tool calls from content as fallback when backend omits structured payload
     result = parse_tool_calls(raw_content, tools)
 
-    # Use parsed content if tool calls were found, otherwise use raw content
-    content_payload = result["content"] if result["tools_called"] else raw_content
+    tool_calls = backend_tool_calls
+    if not tool_calls and result["tools_called"]:
+        tool_calls = result["tool_calls"]
+
+    content_payload = raw_content
     reasoning_split = (
         settings.enable_reasoning_split
         and bool(chat_request.extra_body and chat_request.extra_body.get("reasoning_split"))
     )
 
     thinking_text = ""
-    visible_content = content_payload
 
     if reasoning_split:
         wrapped_content = ensure_think_wrapped(raw_content)
         thinking_text, visible_content = split_think(wrapped_content)
+        content_payload = visible_content
+    else:
+        thinking_text = reasoning_text.strip() if reasoning_text else ""
 
-    client_content = visible_content if reasoning_split else content_payload
+    client_content = content_payload
 
     formatted = openai_formatter.format_complete_response(
         content=client_content,
-        tool_calls=result["tool_calls"] if result["tools_called"] else None,
+        tool_calls=tool_calls,
         model=chat_request.model,
         reasoning_text=thinking_text if reasoning_split else None,
     )
@@ -262,8 +286,8 @@ async def complete_openai_response(chat_request: OpenAIChatRequest, session_id: 
             "role": "assistant",
             "content": ensure_think_wrapped(raw_content),
         }
-        if result["tools_called"]:
-            assistant_message["tool_calls"] = result["tool_calls"]
+        if tool_calls:
+            assistant_message["tool_calls"] = tool_calls
         if reasoning_split and thinking_text:
             assistant_message["reasoning_details"] = [
                 {"type": "chain_of_thought", "text": thinking_text}
@@ -303,22 +327,296 @@ async def stream_openai_response(chat_request: OpenAIChatRequest, session_id: Op
     if chat_request.tools:
         tools = [tool.model_dump(exclude_none=True) for tool in chat_request.tools]
 
-    # Initialize streaming parser
-    streaming_parser = StreamingParser()
-    streaming_parser.set_tools(tools)
-    raw_segments: List[str] = []
-    visible_segments: List[str] = []
-    reasoning_segments: List[str] = []
-    captured_tool_calls: Optional[List[Dict[str, Any]]] = None
-
     reasoning_split = (
         settings.enable_reasoning_split
         and bool(chat_request.extra_body and chat_request.extra_body.get("reasoning_split"))
     )
 
+    final_raw_content = ""
+    final_reasoning_text = ""
+    final_tool_calls: Optional[List[Dict[str, Any]]] = None
+
+    async def prepend_chunk(first_chunk: Dict[str, Any], stream_gen: AsyncIterator[Dict[str, Any]]):
+        yield first_chunk
+        async for item in stream_gen:
+            yield item
+
+    async def structured_stream(chunk_iter: AsyncIterator[Dict[str, Any]]):
+        nonlocal final_raw_content, final_reasoning_text, final_tool_calls
+
+        raw_segments: List[str] = []
+        reasoning_segments: List[str] = []
+        tool_buffers: Dict[int, Dict[str, Any]] = {}
+        think_started = False
+        think_closed = False
+        tool_xml_emitted = False
+        finished = False
+
+        def merge_tool_call_delta(delta_list: List[Dict[str, Any]]) -> None:
+            for call in delta_list:
+                idx = call.get("index", 0)
+                entry = tool_buffers.setdefault(
+                    idx,
+                    {"id": None, "type": "function", "function": {"name": "", "arguments": ""}},
+                )
+                if "id" in call and call["id"]:
+                    entry["id"] = call["id"]
+                if "type" in call and call["type"]:
+                    entry["type"] = call["type"]
+                function_payload = call.get("function", {})
+                if function_payload:
+                    if function_payload.get("name"):
+                        entry["function"]["name"] = function_payload["name"]
+                    if "arguments" in function_payload:
+                        argument_text = function_payload.get("arguments") or ""
+                        entry_args = entry["function"].get("arguments", "")
+                        entry["function"]["arguments"] = entry_args + argument_text
+
+        def finalize_tool_calls() -> List[Dict[str, Any]]:
+            if not tool_buffers:
+                return []
+            ordered: List[Dict[str, Any]] = []
+            for idx in sorted(tool_buffers.keys()):
+                entry = tool_buffers[idx]
+                function_payload = entry.get("function", {})
+                ordered.append(
+                    {
+                        "id": entry.get("id"),
+                        "type": entry.get("type") or "function",
+                        "function": {
+                            "name": function_payload.get("name", ""),
+                            "arguments": function_payload.get("arguments", ""),
+                        },
+                    }
+                )
+            return ordered
+
+        async for chunk in chunk_iter:
+            if not chunk.get("choices"):
+                continue
+
+            choice = chunk["choices"][0]
+            delta = choice.get("delta", {})
+            reasoning_delta = delta.get("reasoning_content")
+            content_delta = delta.get("content")
+            tool_delta = delta.get("tool_calls")
+            finish_reason = choice.get("finish_reason")
+
+            if reasoning_delta:
+                addition = reasoning_delta
+                if not think_started:
+                    think_started = True
+                    think_closed = False
+                    addition = f"<think>{addition}"
+                raw_segments.append(addition)
+                reasoning_segments.append(reasoning_delta)
+                if reasoning_split:
+                    yield openai_formatter.format_streaming_chunk(
+                        reasoning_delta=reasoning_delta,
+                        model=chat_request.model,
+                    )
+                else:
+                    yield openai_formatter.format_streaming_chunk(
+                        delta=addition,
+                        model=chat_request.model,
+                    )
+
+            if (not reasoning_delta) and think_started and not think_closed and (
+                content_delta or tool_delta or finish_reason
+            ):
+                close_text = "</think>\n"
+                raw_segments.append(close_text)
+                if not reasoning_split:
+                    yield openai_formatter.format_streaming_chunk(
+                        delta=close_text,
+                        model=chat_request.model,
+                    )
+                think_closed = True
+
+            if content_delta:
+                raw_segments.append(content_delta)
+                if content_delta:
+                    yield openai_formatter.format_streaming_chunk(
+                        delta=content_delta,
+                        model=chat_request.model,
+                    )
+
+            if tool_delta:
+                merge_tool_call_delta(tool_delta)
+                yield openai_formatter.format_streaming_chunk(
+                    tool_calls=tool_delta,
+                    model=chat_request.model,
+                )
+
+            if finish_reason:
+                if think_started and not think_closed:
+                    close_text = "</think>\n"
+                    raw_segments.append(close_text)
+                    if not reasoning_split:
+                        yield openai_formatter.format_streaming_chunk(
+                            delta=close_text,
+                            model=chat_request.model,
+                        )
+                    think_closed = True
+
+                final_tool_list = finalize_tool_calls()
+                if final_tool_list and not tool_xml_emitted:
+                    xml_block = tool_calls_to_minimax_xml(final_tool_list)
+                    if xml_block:
+                        if raw_segments and not raw_segments[-1].endswith("\n"):
+                            raw_segments.append("\n")
+                        raw_segments.append(xml_block)
+                        if not reasoning_split:
+                            yield openai_formatter.format_streaming_chunk(
+                                delta=xml_block,
+                                model=chat_request.model,
+                            )
+                        tool_xml_emitted = True
+
+                final_raw_content = "".join(raw_segments)
+                final_reasoning_text = "".join(reasoning_segments)
+                final_tool_calls = final_tool_list or None
+
+                final_finish_reason = finish_reason
+                if final_finish_reason == "stop" and final_tool_calls:
+                    final_finish_reason = "tool_calls"
+
+                yield openai_formatter.format_streaming_chunk(
+                    finish_reason=final_finish_reason,
+                    model=chat_request.model,
+                )
+                finished = True
+                break
+
+        if not finished:
+            # No explicit finish_reason received; finalize with current buffers
+            if think_started and not think_closed:
+                raw_segments.append("</think>\n")
+            final_raw_content = "".join(raw_segments)
+            final_reasoning_text = "".join(reasoning_segments)
+            tool_list = finalize_tool_calls()
+            final_tool_calls = tool_list or None
+
+        async for _ in chunk_iter:
+            pass
+
+    async def legacy_stream(chunk_iter: AsyncIterator[Dict[str, Any]]):
+        nonlocal final_raw_content, final_reasoning_text, final_tool_calls
+
+        streaming_parser = StreamingParser()
+        streaming_parser.set_tools(tools)
+        raw_segments: List[str] = []
+        reasoning_segments: List[str] = []
+        captured_tool_calls: Optional[List[Dict[str, Any]]] = None
+
+        async for chunk in chunk_iter:
+            if not chunk.get("choices"):
+                continue
+
+            choice = chunk["choices"][0]
+            delta = choice.get("delta", {})
+            content_delta = delta.get("content", "")
+
+            if content_delta:
+                parsed = streaming_parser.process_chunk(content_delta)
+
+                if parsed:
+                    reasoning_delta = parsed.get("reasoning_delta")
+                    if reasoning_delta:
+                        reasoning_segments.append(reasoning_delta)
+
+                    if parsed["type"] == "content":
+                        raw_delta = parsed.get("raw_delta") or ""
+                        if raw_delta:
+                            raw_segments.append(raw_delta)
+                        if raw_delta or (reasoning_split and reasoning_delta):
+                            yield openai_formatter.format_streaming_chunk(
+                                delta=raw_delta or None,
+                                reasoning_delta=reasoning_delta if reasoning_split else None,
+                                model=chat_request.model,
+                            )
+
+                    elif parsed["type"] == "tool_calls":
+                        captured_tool_calls = parsed["tool_calls"]
+                        raw_delta = parsed.get("raw_delta") or ""
+                        if raw_delta:
+                            raw_segments.append(raw_delta)
+                            yield openai_formatter.format_streaming_chunk(
+                                delta=raw_delta,
+                                reasoning_delta=reasoning_delta if reasoning_split else None,
+                                model=chat_request.model,
+                            )
+                            reasoning_delta = None
+                        elif reasoning_split and reasoning_delta:
+                            yield openai_formatter.format_streaming_chunk(
+                                reasoning_delta=reasoning_delta,
+                                model=chat_request.model,
+                            )
+                        for idx, tool_call in enumerate(parsed["tool_calls"]):
+                            for tool_chunk in openai_formatter.format_tool_call_stream(
+                                tool_call, idx, model=chat_request.model
+                            ):
+                                yield tool_chunk
+
+                    elif parsed["type"] == "reasoning" and reasoning_split and reasoning_delta:
+                        yield openai_formatter.format_streaming_chunk(
+                            reasoning_delta=reasoning_delta,
+                            model=chat_request.model,
+                        )
+
+            finish_reason = choice.get("finish_reason")
+            if finish_reason:
+                pending_tail = streaming_parser.flush_pending()
+                if pending_tail:
+                    raw_delta = pending_tail.get("raw_delta") or ""
+                    reasoning_delta = pending_tail.get("reasoning_delta")
+
+                    if raw_delta:
+                        raw_segments.append(raw_delta)
+                    if reasoning_delta:
+                        reasoning_segments.append(reasoning_delta)
+
+                    if raw_delta or (reasoning_split and reasoning_delta):
+                        yield openai_formatter.format_streaming_chunk(
+                            delta=raw_delta or None,
+                            reasoning_delta=reasoning_delta if reasoning_split else None,
+                            model=chat_request.model,
+                        )
+                if finish_reason == "stop" and streaming_parser.has_tool_calls():
+                    finish_reason = "tool_calls"
+                yield openai_formatter.format_streaming_chunk(
+                    finish_reason=finish_reason,
+                    model=chat_request.model,
+                )
+                break
+
+        pending_tail = streaming_parser.flush_pending()
+        if pending_tail:
+            raw_delta = pending_tail.get("raw_delta") or ""
+            reasoning_delta = pending_tail.get("reasoning_delta")
+
+            if raw_delta:
+                raw_segments.append(raw_delta)
+            if reasoning_delta:
+                reasoning_segments.append(reasoning_delta)
+
+            if raw_delta or (reasoning_split and reasoning_delta):
+                yield openai_formatter.format_streaming_chunk(
+                    delta=raw_delta or None,
+                    reasoning_delta=reasoning_delta if reasoning_split else None,
+                    model=chat_request.model,
+                )
+
+        final_raw_content = "".join(raw_segments) if raw_segments else streaming_parser.get_final_content()
+        final_reasoning_text = "".join(reasoning_segments)
+        captured_tool_calls = captured_tool_calls or streaming_parser.get_last_tool_calls()
+        final_tool_calls = captured_tool_calls
+
+        async for _ in chunk_iter:
+            pass
+
     try:
-        # Stream from TabbyAPI
-        async for chunk in tabby_client.extract_streaming_content(
+        stream_gen = tabby_client.extract_streaming_content(
             messages=normalized_messages,
             model=chat_request.model,
             max_tokens=chat_request.max_tokens,
@@ -328,133 +626,38 @@ async def stream_openai_response(chat_request: OpenAIChatRequest, session_id: Op
             stop=chat_request.stop,
             tools=tools,
             tool_choice=chat_request.tool_choice,
-            add_generation_prompt=True,  # Required for <think> tags
-            banned_strings=settings.banned_chinese_strings if settings.enable_chinese_char_blocking else None
-        ):
-            # Extract delta
-            if "choices" in chunk and len(chunk["choices"]) > 0:
-                choice = chunk["choices"][0]
-                delta = choice.get("delta", {})
-                content_delta = delta.get("content", "")
+            add_generation_prompt=True,
+            banned_strings=settings.banned_chinese_strings if settings.enable_chinese_char_blocking else None,
+        )
 
-                if content_delta:
-                    # Process with streaming parser to extract tool calls and preserve <think> blocks
-                    # Note: Parser will handle prepending <think> tag when it detects </think>
-                    parsed = streaming_parser.process_chunk(content_delta)
+        try:
+            first_chunk = await stream_gen.__anext__()
+        except StopAsyncIteration:
+            yield openai_formatter.format_streaming_done()
+            return
 
-                    if parsed:
-                        reasoning_delta = parsed.get("reasoning_delta")
-                        if reasoning_delta:
-                            reasoning_segments.append(reasoning_delta)
+        first_delta = first_chunk.get("choices", [{}])[0].get("delta", {})
+        structured_mode = bool(first_delta.get("reasoning_content"))
 
-                        if parsed["type"] == "content":
-                            raw_delta = parsed.get("raw_delta") or ""
-                            visible_delta = parsed.get("content_delta") or ""
-                            if raw_delta:
-                                raw_segments.append(raw_delta)
-                            if visible_delta:
-                                visible_segments.append(visible_delta)
+        chunk_iter = prepend_chunk(first_chunk, stream_gen)
 
-                            delta_for_client = raw_delta
-                            if reasoning_split:
-                                delta_for_client = visible_delta or ""
+        if structured_mode:
+            async for event in structured_stream(chunk_iter):
+                yield event
+        else:
+            async for event in legacy_stream(chunk_iter):
+                yield event
 
-                            if delta_for_client or (reasoning_split and reasoning_delta):
-                                yield openai_formatter.format_streaming_chunk(
-                                    delta=delta_for_client or None,
-                                    reasoning_delta=reasoning_delta if reasoning_split else None,
-                                    model=chat_request.model,
-                                )
-
-                        elif parsed["type"] == "tool_calls":
-                            captured_tool_calls = parsed["tool_calls"]
-                            if reasoning_split and reasoning_delta:
-                                yield openai_formatter.format_streaming_chunk(
-                                    reasoning_delta=reasoning_delta,
-                                    model=chat_request.model,
-                                )
-                            for idx, tool_call in enumerate(parsed["tool_calls"]):
-                                for tool_chunk in openai_formatter.format_tool_call_stream(
-                                    tool_call, idx, model=chat_request.model
-                                ):
-                                    yield tool_chunk
-
-                        elif parsed["type"] == "reasoning":
-                            if reasoning_split and reasoning_delta:
-                                yield openai_formatter.format_streaming_chunk(
-                                    reasoning_delta=reasoning_delta,
-                                    model=chat_request.model,
-                                )
-
-                # Check for finish
-                finish_reason = choice.get("finish_reason")
-                if finish_reason:
-                    pending_tail = streaming_parser.flush_pending()
-                    if pending_tail:
-                        raw_delta = pending_tail.get("raw_delta") or ""
-                        visible_delta = pending_tail.get("content_delta") or ""
-                        reasoning_delta = pending_tail.get("reasoning_delta")
-
-                        if raw_delta:
-                            raw_segments.append(raw_delta)
-                        if visible_delta:
-                            visible_segments.append(visible_delta)
-                        if reasoning_delta:
-                            reasoning_segments.append(reasoning_delta)
-
-                        delta_for_client = raw_delta
-                        if reasoning_split:
-                            delta_for_client = visible_delta or ""
-
-                        if delta_for_client or (reasoning_split and reasoning_delta):
-                            yield openai_formatter.format_streaming_chunk(
-                                delta=delta_for_client or None,
-                                reasoning_delta=reasoning_delta if reasoning_split else None,
-                                model=chat_request.model,
-                            )
-                    # Override finish_reason if tool calls were detected
-                    if finish_reason == "stop" and streaming_parser.has_tool_calls():
-                        finish_reason = "tool_calls"
-                    yield openai_formatter.format_streaming_chunk(finish_reason=finish_reason, model=chat_request.model)
-
-        # Send done
-        pending_tail = streaming_parser.flush_pending()
-        if pending_tail:
-            raw_delta = pending_tail.get("raw_delta") or ""
-            visible_delta = pending_tail.get("content_delta") or ""
-            reasoning_delta = pending_tail.get("reasoning_delta")
-
-            if raw_delta:
-                raw_segments.append(raw_delta)
-            if visible_delta:
-                visible_segments.append(visible_delta)
-            if reasoning_delta:
-                reasoning_segments.append(reasoning_delta)
-
-            delta_for_client = raw_delta
-            if reasoning_split:
-                delta_for_client = visible_delta or ""
-
-            if delta_for_client or (reasoning_split and reasoning_delta):
-                yield openai_formatter.format_streaming_chunk(
-                    delta=delta_for_client or None,
-                    reasoning_delta=reasoning_delta if reasoning_split else None,
-                    model=chat_request.model,
-                )
-
-        final_raw_content = "".join(raw_segments) if raw_segments else streaming_parser.get_final_content()
-        final_reasoning = "".join(reasoning_segments)
-        captured_tool_calls = captured_tool_calls or streaming_parser.get_last_tool_calls()
         if session_id:
             assistant_message: Dict[str, Any] = {
                 "role": "assistant",
                 "content": ensure_think_wrapped(final_raw_content),
             }
-            if captured_tool_calls:
-                assistant_message["tool_calls"] = captured_tool_calls
-            if reasoning_split and final_reasoning:
+            if final_tool_calls:
+                assistant_message["tool_calls"] = final_tool_calls
+            if reasoning_split and final_reasoning_text:
                 assistant_message["reasoning_details"] = [
-                    {"type": "chain_of_thought", "text": final_reasoning}
+                    {"type": "chain_of_thought", "text": final_reasoning_text}
                 ]
             session_store.append_message(session_id, assistant_message)
 

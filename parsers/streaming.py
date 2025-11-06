@@ -131,11 +131,20 @@ class StreamingParser:
                         response["reasoning_delta"] = aggregate_reasoning
                     return response
 
-                self.sent_position = len(self.buffer)
+                tool_end_idx = self.buffer.find("</minimax:tool_call>")
+                if tool_end_idx == -1:
+                    tool_end_idx = len(self.buffer)
+                else:
+                    tool_end_idx += len("</minimax:tool_call>")
+
+                tool_delta = self.buffer[self.sent_position:tool_end_idx]
+                self.sent_position = tool_end_idx
                 payload: Dict[str, Any] = {
                     "type": "tool_calls",
                     "tool_calls": result["tool_calls"],
                 }
+                if tool_delta:
+                    payload["raw_delta"] = tool_delta
                 if reasoning_delta:
                     payload["reasoning_delta"] = reasoning_delta
                 return payload
@@ -178,10 +187,7 @@ class StreamingParser:
         return None
 
     def get_final_content(self) -> str:
-        """Get complete final content with tool calls removed."""
-        if "<minimax:tool_call>" in self.buffer:
-            result = parse_tool_calls(self.buffer, self.tools)
-            return result.get("content") or ""
+        """Get complete final content as streamed (including tool blocks)."""
         return self.buffer
 
     def get_last_tool_calls(self) -> Optional[List[Dict[str, Any]]]:

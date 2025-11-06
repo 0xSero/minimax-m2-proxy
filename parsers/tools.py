@@ -10,6 +10,53 @@ import uuid
 from typing import Any, Dict, List, Optional
 
 
+def _format_param_value_for_xml(value: Any) -> str:
+    """Convert a parameter value to string for XML embedding."""
+    if isinstance(value, (dict, list)):
+        try:
+            return json.dumps(value, ensure_ascii=False)
+        except (TypeError, ValueError):
+            return str(value)
+    return str(value)
+
+
+def tool_calls_to_minimax_xml(tool_calls: Optional[List[Dict[str, Any]]]) -> Optional[str]:
+    """Render OpenAI-format tool calls as MiniMax XML blocks."""
+    if not tool_calls:
+        return None
+
+    lines: List[str] = ["<minimax:tool_call>"]
+
+    for call in tool_calls:
+        function = call.get("function", {}) if isinstance(call, dict) else {}
+        name = function.get("name") or call.get("name") or ""
+        lines.append(f"<invoke name=\"{name}\">")
+
+        arguments = function.get("arguments")
+        parsed_args: Any = arguments
+
+        if isinstance(arguments, str):
+            try:
+                parsed_args = json.loads(arguments)
+            except json.JSONDecodeError:
+                parsed_args = arguments
+
+        if isinstance(parsed_args, dict):
+            for param_name, param_value in parsed_args.items():
+                lines.append(f"<parameter name=\"{param_name}\">")
+                lines.append(_format_param_value_for_xml(param_value))
+                lines.append("</parameter>")
+        else:
+            lines.append("<parameter name=\"input\">")
+            lines.append(_format_param_value_for_xml(parsed_args))
+            lines.append("</parameter>")
+
+        lines.append("</invoke>")
+
+    lines.append("</minimax:tool_call>")
+    return "\n".join(lines)
+
+
 def extract_name(name_str: str) -> str:
     """Extract name from quoted string"""
     name_str = name_str.strip()
