@@ -107,6 +107,23 @@ def normalize_openai_history(messages: List[Dict[str, Any]]) -> List[Dict[str, A
             elif content and "</think>" in content:
                 msg_copy["content"] = ensure_think_wrapped(content)
 
+            tool_calls = msg_copy.get("tool_calls")
+            if tool_calls:
+                xml_block = tool_calls_to_minimax_xml(tool_calls)
+                if xml_block:
+                    updated_content = msg_copy.get("content") or ""
+                    if "</think>" in updated_content and "<think>" not in updated_content:
+                        updated_content = ensure_think_wrapped(updated_content)
+
+                    if xml_block not in updated_content:
+                        stripped = updated_content.rstrip()
+                        if stripped:
+                            msg_copy["content"] = f"{stripped}\n\n{xml_block}"
+                        else:
+                            msg_copy["content"] = xml_block
+                    else:
+                        msg_copy["content"] = updated_content
+
         normalized.append(msg_copy)
     return normalized
 
@@ -257,7 +274,13 @@ async def complete_openai_response(chat_request: OpenAIChatRequest, session_id: 
     if not tool_calls and result["tools_called"]:
         tool_calls = result["tool_calls"]
 
-    content_payload = raw_content
+    content_without_tool_blocks = raw_content
+    if result["tools_called"] and result["content"]:
+        content_without_tool_blocks = ensure_think_wrapped(result["content"])
+    elif result["tools_called"] and not result["content"]:
+        content_without_tool_blocks = ""
+
+    content_payload = content_without_tool_blocks
     reasoning_split = (
         settings.enable_reasoning_split
         and bool(chat_request.extra_body and chat_request.extra_body.get("reasoning_split"))
@@ -266,8 +289,8 @@ async def complete_openai_response(chat_request: OpenAIChatRequest, session_id: 
     thinking_text = ""
 
     if reasoning_split:
-        wrapped_content = ensure_think_wrapped(raw_content)
-        thinking_text, visible_content = split_think(wrapped_content)
+        wrapped_for_split = ensure_think_wrapped(content_without_tool_blocks)
+        thinking_text, visible_content = split_think(wrapped_for_split)
         content_payload = visible_content
     else:
         thinking_text = reasoning_text.strip() if reasoning_text else ""
@@ -466,11 +489,6 @@ async def stream_openai_response(chat_request: OpenAIChatRequest, session_id: Op
                         if raw_segments and not raw_segments[-1].endswith("\n"):
                             raw_segments.append("\n")
                         raw_segments.append(xml_block)
-                        if not reasoning_split:
-                            yield openai_formatter.format_streaming_chunk(
-                                delta=xml_block,
-                                model=chat_request.model,
-                            )
                         tool_xml_emitted = True
 
                 final_raw_content = "".join(raw_segments)
@@ -527,11 +545,13 @@ async def stream_openai_response(chat_request: OpenAIChatRequest, session_id: Op
 
                     if parsed["type"] == "content":
                         raw_delta = parsed.get("raw_delta") or ""
+                        visible_delta = parsed.get("content_delta") or ""
                         if raw_delta:
                             raw_segments.append(raw_delta)
-                        if raw_delta or (reasoning_split and reasoning_delta):
+                        delta_for_client = raw_delta if not reasoning_split else visible_delta
+                        if delta_for_client or (reasoning_split and reasoning_delta):
                             yield openai_formatter.format_streaming_chunk(
-                                delta=raw_delta or None,
+                                delta=delta_for_client or None,
                                 reasoning_delta=reasoning_delta if reasoning_split else None,
                                 model=chat_request.model,
                             )
@@ -541,13 +561,8 @@ async def stream_openai_response(chat_request: OpenAIChatRequest, session_id: Op
                         raw_delta = parsed.get("raw_delta") or ""
                         if raw_delta:
                             raw_segments.append(raw_delta)
-                            yield openai_formatter.format_streaming_chunk(
-                                delta=raw_delta,
-                                reasoning_delta=reasoning_delta if reasoning_split else None,
-                                model=chat_request.model,
-                            )
                             reasoning_delta = None
-                        elif reasoning_split and reasoning_delta:
+                        if reasoning_split and reasoning_delta:
                             yield openai_formatter.format_streaming_chunk(
                                 reasoning_delta=reasoning_delta,
                                 model=chat_request.model,
@@ -576,9 +591,10 @@ async def stream_openai_response(chat_request: OpenAIChatRequest, session_id: Op
                     if reasoning_delta:
                         reasoning_segments.append(reasoning_delta)
 
-                    if raw_delta or (reasoning_split and reasoning_delta):
+                    sendable_raw_delta = raw_delta if raw_delta and "<minimax:tool_call>" not in raw_delta else None
+                    if sendable_raw_delta or (reasoning_split and reasoning_delta):
                         yield openai_formatter.format_streaming_chunk(
-                            delta=raw_delta or None,
+                            delta=sendable_raw_delta,
                             reasoning_delta=reasoning_delta if reasoning_split else None,
                             model=chat_request.model,
                         )
@@ -600,9 +616,10 @@ async def stream_openai_response(chat_request: OpenAIChatRequest, session_id: Op
             if reasoning_delta:
                 reasoning_segments.append(reasoning_delta)
 
-            if raw_delta or (reasoning_split and reasoning_delta):
+            sendable_raw_delta = raw_delta if raw_delta and "<minimax:tool_call>" not in raw_delta else None
+            if sendable_raw_delta or (reasoning_split and reasoning_delta):
                 yield openai_formatter.format_streaming_chunk(
-                    delta=raw_delta or None,
+                    delta=sendable_raw_delta,
                     reasoning_delta=reasoning_delta if reasoning_split else None,
                     model=chat_request.model,
                 )
