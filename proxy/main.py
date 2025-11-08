@@ -9,6 +9,7 @@ from contextlib import asynccontextmanager
 from typing import Any, AsyncIterator, Dict, List, Optional
 
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from .client import TabbyClient
@@ -158,6 +159,15 @@ app = FastAPI(
     description="Dual-API proxy for MiniMax-M2 with OpenAI and Anthropic compatibility",
     version="0.1.0",
     lifespan=lifespan
+)
+
+# Configure CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Allow all origins
+    allow_credentials=True,
+    allow_methods=["*"],  # Allow all methods
+    allow_headers=["*"],  # Allow all headers
 )
 
 
