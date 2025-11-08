@@ -72,7 +72,7 @@ Now you can use MiniMax-M2 with **any standard tool** without modifications.
            ▼
 ┌─────────────────────────┐
 │  MiniMax-M2 Model       │
-│  (456B MoE)             │
+│  (229B 10A MoE)         │
 └─────────────────────────┘
 ```
 
