@@ -1,7 +1,9 @@
 """Pydantic models for API requests and responses"""
 
-from pydantic import BaseModel, Field, field_validator
+import json
 from typing import List, Optional, Dict, Any, Literal, Union
+
+from pydantic import BaseModel, Field, field_validator
 
 
 # OpenAI Models
@@ -117,6 +119,49 @@ def anthropic_tools_to_openai(tools: Optional[List[AnthropicTool]]) -> Optional[
     return openai_tools
 
 
+def _serialize_tool_arguments(input_payload: Optional[Union[str, Dict[str, Any], List[Any]]]) -> str:
+    """Convert Anthropic tool_use input payloads to OpenAI-style JSON strings."""
+    if input_payload is None:
+        return "{}"
+
+    if isinstance(input_payload, str):
+        stripped = input_payload.strip()
+        if not stripped:
+            return "{}"
+        try:
+            json.loads(input_payload)
+            return input_payload
+        except json.JSONDecodeError:
+            return json.dumps(stripped, ensure_ascii=False)
+
+    try:
+        return json.dumps(input_payload, ensure_ascii=False)
+    except (TypeError, ValueError):
+        return json.dumps(str(input_payload), ensure_ascii=False)
+
+
+def _stringify_tool_result_content(content: Optional[Union[str, List[Dict[str, Any]]]]) -> str:
+    """Flatten tool_result content payloads to plain text."""
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: List[str] = []
+        for entry in content:
+            if isinstance(entry, dict):
+                text_value = entry.get("text")
+                if text_value:
+                    parts.append(text_value)
+        if parts:
+            return "\n".join(parts)
+        try:
+            return json.dumps(content, ensure_ascii=False)
+        except (TypeError, ValueError):
+            return str(content)
+    return str(content)
+
+
 def anthropic_messages_to_openai(messages: List[AnthropicMessage]) -> List[Dict[str, Any]]:
     """Convert Anthropic messages to OpenAI format
 
@@ -133,35 +178,40 @@ def anthropic_messages_to_openai(messages: List[AnthropicMessage]) -> List[Dict[
                 "content": msg.content
             })
         else:
-            # Content blocks - merge text blocks
-            text_parts = []
+            # Content blocks - merge text and thinking blocks in order
+            text_segments: List[str] = []
             tool_calls = []
             tool_results = []
 
             for block in msg.content:
-                if block.type == "text" and block.text:
-                    text_parts.append(block.text)
+                if block.type == "thinking" and block.thinking:
+                    text_segments.append(f"<think>{block.thinking}</think>")
+                elif block.type == "text" and block.text:
+                    text_segments.append(block.text)
+                elif block.type == "image":
+                    text_segments.append("[image]")
                 elif block.type == "tool_use":
                     tool_calls.append({
                         "id": block.id,
                         "type": "function",
                         "function": {
                             "name": block.name,
-                            "arguments": block.input
+                            "arguments": _serialize_tool_arguments(block.input)
                         }
                     })
                 elif block.type == "tool_result":
                     # Collect tool results - will be formatted as user message content
                     tool_results.append({
                         "tool_use_id": block.tool_use_id,
-                        "content": block.content if isinstance(block.content, str) else str(block.content)
+                        "content": _stringify_tool_result_content(block.content)
                     })
 
             # Build message
-            if text_parts or tool_calls:
+            has_text = any(segment for segment in text_segments)
+            if has_text or tool_calls:
                 message = {
                     "role": msg.role,
-                    "content": "\n".join(text_parts) if text_parts else None
+                    "content": "\n".join(segment for segment in text_segments if segment) if has_text else ""
                 }
                 if tool_calls:
                     message["tool_calls"] = tool_calls
