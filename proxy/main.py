@@ -15,6 +15,7 @@ from .client import TabbyClient
 from .config import settings
 from .models import (
     AnthropicChatRequest,
+    AnthropicMessage,
     OpenAIChatRequest,
     anthropic_messages_to_openai,
     anthropic_tools_to_openai,
@@ -753,6 +754,10 @@ async def complete_anthropic_response(anthropic_request: AnthropicChatRequest, s
     for i, msg in enumerate(openai_messages):
         logger.debug(f"  Message {i}: role={msg.get('role')}, content_len={len(str(msg.get('content', '')))}, has_tool_calls={bool(msg.get('tool_calls'))}")
 
+    thinking_payload = anthropic_request.thinking or {
+        "max_thinking_tokens": settings.anthropic_default_thinking_tokens
+    }
+
     # Call TabbyAPI
     response = await tabby_client.chat_completion(
         messages=normalized_messages,
@@ -765,13 +770,15 @@ async def complete_anthropic_response(anthropic_request: AnthropicChatRequest, s
         tools=tools,
         tool_choice=anthropic_request.tool_choice,
         add_generation_prompt=True,  # Required for <think> tags
-        banned_strings=settings.banned_chinese_strings if settings.enable_chinese_char_blocking else None
+        banned_strings=settings.banned_chinese_strings if settings.enable_chinese_char_blocking else None,
+        thinking=thinking_payload,
     )
 
     if settings.log_raw_responses:
         logger.debug(f"Raw TabbyAPI response: {response}")
 
-    raw_content = response["choices"][0]["message"].get("content", "")
+    choice_payload = response["choices"][0]
+    raw_content = choice_payload["message"].get("content", "")
     wrapped_raw_content = ensure_think_wrapped(raw_content)
 
     # Parse tool calls
@@ -787,12 +794,28 @@ async def complete_anthropic_response(anthropic_request: AnthropicChatRequest, s
     else:
         visible_text = content_source
 
+    if not (visible_text and visible_text.strip()) and choice_payload.get("finish_reason") == "length":
+        visible_text = "(MiniMax stopped before it could produce a visible reply. Try increasing `max_tokens`.)"
+
+    # Extract usage statistics from backend response
+    usage = response.get("usage", {
+        "input_tokens": 0,
+        "output_tokens": 0
+    })
+    # Convert OpenAI field names to Anthropic format if needed
+    if "prompt_tokens" in usage:
+        usage = {
+            "input_tokens": usage.get("prompt_tokens", 0),
+            "output_tokens": usage.get("completion_tokens", 0)
+        }
+
     # Format as Anthropic response
     formatted = anthropic_formatter.format_complete_response(
         content=visible_text,
         tool_calls=result["tool_calls"] if result["tools_called"] else None,
         model=anthropic_request.model,
         thinking_text=thinking_text if settings.enable_anthropic_thinking_blocks else None,
+        usage=usage,
     )
 
     if session_id:
@@ -845,6 +868,10 @@ async def stream_anthropic_response(anthropic_request: AnthropicChatRequest, ses
     streaming_parser.set_tools(tools)
     captured_tool_calls: Optional[list[Dict[str, Any]]] = None
     thinking_block_started = False
+    text_emitted = False
+    thinking_payload = anthropic_request.thinking or {
+        "max_thinking_tokens": settings.anthropic_default_thinking_tokens
+    }
 
     try:
         # Send message_start
@@ -866,7 +893,8 @@ async def stream_anthropic_response(anthropic_request: AnthropicChatRequest, ses
             tools=tools,
             tool_choice=anthropic_request.tool_choice,
             add_generation_prompt=True,  # Required for <think> tags
-            banned_strings=settings.banned_chinese_strings if settings.enable_chinese_char_blocking else None
+            banned_strings=settings.banned_chinese_strings if settings.enable_chinese_char_blocking else None,
+            thinking=thinking_payload,
         ):
             # Extract delta
             if "choices" in chunk and len(chunk["choices"]) > 0:
@@ -908,6 +936,7 @@ async def stream_anthropic_response(anthropic_request: AnthropicChatRequest, ses
                                     delta_payload,
                                     delta_type="text_delta"
                                 )
+                                text_emitted = True
 
                         elif parsed["type"] == "tool_calls":
                             # Close text block if open
@@ -947,6 +976,16 @@ async def stream_anthropic_response(anthropic_request: AnthropicChatRequest, ses
 
         # Send message_stop
         if thinking_block_started:
+            yield anthropic_formatter.format_content_block_stop(content_block_index)
+            thinking_block_started = False
+
+        if not text_emitted and not captured_tool_calls:
+            yield anthropic_formatter.format_content_block_start(content_block_index, "text")
+            yield anthropic_formatter.format_content_block_delta(
+                content_block_index,
+                "(MiniMax stopped before it could produce a visible reply. Try increasing `max_tokens`.)",
+                delta_type="text_delta",
+            )
             yield anthropic_formatter.format_content_block_stop(content_block_index)
         yield anthropic_formatter.format_message_stop()
 
