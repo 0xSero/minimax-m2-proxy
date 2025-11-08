@@ -16,6 +16,7 @@ class AnthropicFormatter:
         model: str = "minimax-m2",
         stop_reason: str = "end_turn",
         thinking_text: Optional[str] = None,
+        usage: Optional[Dict[str, int]] = None,
     ) -> Dict[str, Any]:
         """
         Format a complete (non-streaming) response.
@@ -25,6 +26,8 @@ class AnthropicFormatter:
             tool_calls: List of tool calls in OpenAI format (will be converted)
             model: Model name
             stop_reason: One of: end_turn, max_tokens, stop_sequence, tool_use
+            thinking_text: Optional thinking block content
+            usage: Optional usage statistics from backend
 
         Returns:
             Anthropic Messages response
@@ -63,8 +66,7 @@ class AnthropicFormatter:
             "content": content_blocks,
             "model": model,
             "stop_reason": stop_reason,
-            "stop_sequence": None,
-            "usage": {
+            "usage": usage or {
                 "input_tokens": 0,
                 "output_tokens": 0
             }
@@ -106,7 +108,6 @@ class AnthropicFormatter:
                     "content": [],
                     "model": model,
                     "stop_reason": None,
-                    "stop_sequence": None,
                     "usage": {"input_tokens": 0, "output_tokens": 0}
                 }
             }
@@ -162,13 +163,13 @@ class AnthropicFormatter:
         )
 
     @staticmethod
-    def format_message_delta(stop_reason: str = "end_turn") -> str:
+    def format_message_delta(stop_reason: str = "end_turn", output_tokens: int = 0) -> str:
         """Format message_delta event"""
         return AnthropicFormatter.format_streaming_event(
             "message_delta",
             {
-                "delta": {"stop_reason": stop_reason, "stop_sequence": None},
-                "usage": {"output_tokens": 0}
+                "delta": {"stop_reason": stop_reason},
+                "usage": {"output_tokens": output_tokens}
             }
         )
 

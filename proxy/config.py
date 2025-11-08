@@ -32,6 +32,7 @@ class Settings(BaseSettings):
     # Reasoning/thinking presentation
     enable_reasoning_split: bool = True
     enable_anthropic_thinking_blocks: bool = True
+    anthropic_default_thinking_tokens: int = 128
 
     # Validation toggles
     require_tool_link_validation: bool = True
