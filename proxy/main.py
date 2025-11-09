@@ -17,6 +17,7 @@ from .config import settings
 from .models import (
     AnthropicChatRequest,
     AnthropicMessage,
+    AnthropicTool,
     OpenAIChatRequest,
     anthropic_messages_to_openai,
     anthropic_tools_to_openai,
@@ -85,6 +86,66 @@ def extract_session_id(raw_request: Request, extra_body: Optional[Dict[str, Any]
             return body_session.strip()
 
     return None
+
+
+def append_tool_examples_to_system(system_message: Optional[str], tools: Optional[List[AnthropicTool]]) -> str:
+    """Append tool calling format examples to system message when tools are present"""
+    if not tools:
+        return system_message or ""
+
+    base_system = system_message or ""
+
+    # Create example with first tool if available
+    example_tool = tools[0] if tools else None
+    if not example_tool:
+        return base_system
+
+    # Get required parameters from schema
+    required_params = example_tool.input_schema.get("required", [])
+    properties = example_tool.input_schema.get("properties", {})
+
+    # Build example parameters
+    example_params = []
+    for param_name in (required_params[:2] if len(required_params) > 2 else required_params):
+        param_schema = properties.get(param_name, {})
+        param_type = param_schema.get("type", "string")
+
+        # Generate example value based on type
+        if param_type == "string":
+            example_value = f"example {param_name}"
+        elif param_type == "integer":
+            example_value = "42"
+        elif param_type == "number":
+            example_value = "3.14"
+        elif param_type == "boolean":
+            example_value = "true"
+        elif param_type == "array":
+            example_value = '["item1", "item2"]'
+        elif param_type == "object":
+            example_value = '{"key": "value"}'
+        else:
+            example_value = f"example_{param_name}"
+
+        example_params.append(f'<parameter name="{param_name}">{example_value}</parameter>')
+
+    tool_example = f"""
+
+IMPORTANT: When calling tools, you MUST use this exact XML format:
+
+<minimax:tool_call>
+<invoke name="{example_tool.name}">
+{chr(10).join(example_params)}
+</invoke>
+</minimax:tool_call>
+
+Rules for tool calling:
+1. Always provide ALL required parameters for each tool
+2. Parameter values must match the expected type (string, integer, boolean, etc.)
+3. Never use empty strings for parameters unless explicitly allowed
+4. You can call multiple tools by using multiple <invoke> blocks within one <minimax:tool_call>
+5. Place tool calls AFTER any reasoning or text content"""
+
+    return base_system + tool_example
 
 
 def normalize_openai_history(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -731,10 +792,11 @@ async def complete_anthropic_response(anthropic_request: AnthropicChatRequest, s
     # Convert Anthropic format to OpenAI format
     openai_messages = anthropic_messages_to_openai(anthropic_request.messages)
 
-    # Add system message if present
-    if anthropic_request.system:
-        system_content = anthropic_request.system if isinstance(anthropic_request.system, str) else str(anthropic_request.system)
-        openai_messages.insert(0, {"role": "system", "content": system_content})
+    # Add system message with tool examples if present
+    system_content = anthropic_request.system if isinstance(anthropic_request.system, str) else str(anthropic_request.system) if anthropic_request.system else None
+    enhanced_system = append_tool_examples_to_system(system_content, anthropic_request.tools)
+    if enhanced_system:
+        openai_messages.insert(0, {"role": "system", "content": enhanced_system})
 
     repair_result: RepairResult = session_store.inject_or_repair(
         openai_messages,
@@ -846,10 +908,11 @@ async def stream_anthropic_response(anthropic_request: AnthropicChatRequest, ses
     # Convert Anthropic format to OpenAI format
     openai_messages = anthropic_messages_to_openai(anthropic_request.messages)
 
-    # Add system message if present
-    if anthropic_request.system:
-        system_content = anthropic_request.system if isinstance(anthropic_request.system, str) else str(anthropic_request.system)
-        openai_messages.insert(0, {"role": "system", "content": system_content})
+    # Add system message with tool examples if present
+    system_content = anthropic_request.system if isinstance(anthropic_request.system, str) else str(anthropic_request.system) if anthropic_request.system else None
+    enhanced_system = append_tool_examples_to_system(system_content, anthropic_request.tools)
+    if enhanced_system:
+        openai_messages.insert(0, {"role": "system", "content": enhanced_system})
 
     repair_result: RepairResult = session_store.inject_or_repair(
         openai_messages,
