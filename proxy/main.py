@@ -27,6 +27,7 @@ from formatters.openai import OpenAIFormatter
 from parsers.reasoning import ensure_think_wrapped, split_think
 from parsers.streaming import StreamingParser
 from parsers.tools import parse_tool_calls, tool_calls_to_minimax_xml
+from parsers.validation import validate_and_repair_tool_calls
 from .session_store import RepairResult, session_store
 
 
@@ -856,6 +857,20 @@ async def complete_anthropic_response(anthropic_request: AnthropicChatRequest, s
     # Parse tool calls
     result = parse_tool_calls(wrapped_raw_content, tools)
 
+    # Validate and repair tool calls
+    validated_tool_calls = result["tool_calls"]
+    if result["tools_called"] and result["tool_calls"]:
+        validated_tool_calls, validation_warnings = validate_and_repair_tool_calls(
+            result["tool_calls"],
+            tools
+        )
+        if validation_warnings:
+            for warning in validation_warnings:
+                logger.warning(f"Tool validation issue: {warning}")
+        if len(validated_tool_calls) < len(result["tool_calls"]):
+            dropped_count = len(result["tool_calls"]) - len(validated_tool_calls)
+            logger.error(f"Dropped {dropped_count} malformed tool call(s) with missing/empty parameters")
+
     content_source = result["content"] if result["tools_called"] else wrapped_raw_content
     content_source = ensure_think_wrapped(content_source) if content_source else ""
 
@@ -884,7 +899,7 @@ async def complete_anthropic_response(anthropic_request: AnthropicChatRequest, s
     # Format as Anthropic response
     formatted = anthropic_formatter.format_complete_response(
         content=visible_text,
-        tool_calls=result["tool_calls"] if result["tools_called"] else None,
+        tool_calls=validated_tool_calls if result["tools_called"] and validated_tool_calls else None,
         model=anthropic_request.model,
         thinking_text=thinking_text if settings.enable_anthropic_thinking_blocks else None,
         usage=usage,
@@ -895,8 +910,8 @@ async def complete_anthropic_response(anthropic_request: AnthropicChatRequest, s
             "role": "assistant",
             "content": wrapped_raw_content,
         }
-        if result["tools_called"]:
-            assistant_message["tool_calls"] = result["tool_calls"]
+        if result["tools_called"] and validated_tool_calls:
+            assistant_message["tool_calls"] = validated_tool_calls
         session_store.append_message(session_id, assistant_message)
 
     return formatted
@@ -1022,9 +1037,18 @@ async def stream_anthropic_response(anthropic_request: AnthropicChatRequest, ses
                                 content_block_index += 1
                                 thinking_block_started = False
 
-                            # Send tool use blocks
-                            captured_tool_calls = parsed["tool_calls"]
-                            for tool_call in parsed["tool_calls"]:
+                            # Validate tool calls before sending
+                            validated_tool_calls, validation_warnings = validate_and_repair_tool_calls(
+                                parsed["tool_calls"],
+                                tools
+                            )
+                            if validation_warnings:
+                                for warning in validation_warnings:
+                                    logger.warning(f"Streaming tool validation: {warning}")
+
+                            # Send tool use blocks (only validated ones)
+                            captured_tool_calls = validated_tool_calls
+                            for tool_call in validated_tool_calls:
                                 yield anthropic_formatter.format_tool_use_delta(content_block_index, tool_call)
                                 yield anthropic_formatter.format_content_block_stop(content_block_index)
                                 content_block_index += 1
