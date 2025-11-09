@@ -70,6 +70,14 @@ class AnthropicContentBlock(BaseModel):
     tool_use_id: Optional[str] = None  # For tool_result
     content: Optional[Union[str, List[Dict[str, Any]]]] = None  # For tool_result
 
+    @field_validator('input', mode='before')
+    @classmethod
+    def normalize_input(cls, v):
+        """Normalize tool_use input field - convert empty strings to empty dict"""
+        if v == "":
+            return {}
+        return v
+
 
 class AnthropicMessage(BaseModel):
     """Anthropic message format"""
