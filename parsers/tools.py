@@ -127,10 +127,10 @@ def parse_tool_calls(model_output: str, tools: Optional[List[Dict]] = None) -> D
     tool_calls = []
 
     try:
-        # Match all <minimax:tool_call> blocks
+        # Match all <minimax:tool_call> blocks (MiniMax may add whitespace around attributes)
         tool_call_regex = re.compile(r"<minimax:tool_call>(.*?)</minimax:tool_call>", re.DOTALL)
-        invoke_regex = re.compile(r"<invoke name=(.*?)</invoke>", re.DOTALL)
-        parameter_regex = re.compile(r"<parameter name=(.*?)</parameter>", re.DOTALL)
+        invoke_regex = re.compile(r"<invoke\s+name\s*=\s*(.*?)</invoke>", re.DOTALL)
+        parameter_regex = re.compile(r"<parameter\s+name\s*=\s*(.*?)</parameter>", re.DOTALL)
 
         # Iterate through all tool_call blocks
         for tool_call_match in tool_call_regex.findall(model_output):
