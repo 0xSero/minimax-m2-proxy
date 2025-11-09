@@ -60,9 +60,20 @@ def tool_calls_to_minimax_xml(tool_calls: Optional[List[Dict[str, Any]]]) -> Opt
 def extract_name(name_str: str) -> str:
     """Extract name from quoted string"""
     name_str = name_str.strip()
-    if (name_str.startswith('"') and name_str.endswith('"')) or \
-       (name_str.startswith("'") and name_str.endswith("'")):
-        return name_str[1:-1]
+    if not name_str:
+        return name_str
+
+    if name_str[0] in {'"', "'"}:
+        quote = name_str[0]
+        end_idx = name_str.find(quote, 1)
+        if end_idx != -1:
+            return name_str[1:end_idx]
+
+    for separator in [" ", "\t", "\n", "\r", ">"]:
+        sep_idx = name_str.find(separator)
+        if sep_idx != -1:
+            return name_str[:sep_idx]
+
     return name_str
 
 
