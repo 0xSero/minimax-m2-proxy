@@ -34,7 +34,9 @@ def test_anthropic_messages_to_openai_serializes_tool_arguments() -> None:
 
 
 def test_anthropic_messages_to_openai_preserves_json_string_arguments() -> None:
-    raw_arguments = '{"query": "pizza"}'
+    # Note: Anthropic API spec requires input to be a dict, not a JSON string
+    # This test verifies that dict input is properly serialized to JSON string
+    input_dict = {"query": "pizza"}
     message = AnthropicMessage(
         role="assistant",
         content=[
@@ -42,7 +44,7 @@ def test_anthropic_messages_to_openai_preserves_json_string_arguments() -> None:
                 type="tool_use",
                 id="toolu_456",
                 name="search",
-                input=raw_arguments,
+                input=input_dict,
             )
         ],
     )
@@ -50,7 +52,9 @@ def test_anthropic_messages_to_openai_preserves_json_string_arguments() -> None:
     converted = anthropic_messages_to_openai([message])
     tool_call = converted[0]["tool_calls"][0]["function"]
 
-    assert tool_call["arguments"] == raw_arguments
+    # Arguments should be a JSON string in OpenAI format
+    assert isinstance(tool_call["arguments"], str)
+    assert json.loads(tool_call["arguments"]) == input_dict
 
 
 def test_anthropic_messages_to_openai_includes_thinking_blocks() -> None:

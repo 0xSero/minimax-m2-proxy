@@ -788,20 +788,56 @@ async def complete_anthropic_response(anthropic_request: AnthropicChatRequest, s
         logger.debug(f"Raw TabbyAPI response: {response}")
 
     choice_payload = response["choices"][0]
-    raw_content = choice_payload["message"].get("content", "")
+    message_payload = choice_payload["message"]
+    backend_content = message_payload.get("content", "") or ""
+    reasoning_text = message_payload.get("reasoning_content") or ""
+    backend_tool_calls = message_payload.get("tool_calls")
+
+    # Build raw content with reasoning and content
+    sections: List[str] = []
+
+    if reasoning_text:
+        trimmed_reasoning = reasoning_text.rstrip()
+        sections.append(f"<think>{trimmed_reasoning}</think>")
+
+    if backend_content.strip():
+        sections.append(backend_content)
+
+    if backend_tool_calls:
+        xml_block = tool_calls_to_minimax_xml(backend_tool_calls)
+        if xml_block:
+            sections.append(xml_block)
+
+    raw_content = "\n\n".join(section for section in sections if section).strip()
+    if not raw_content:
+        raw_content = backend_content
+
     wrapped_raw_content = ensure_think_wrapped(raw_content)
 
-    # Parse tool calls
+    # Parse tool calls from content as fallback when backend omits structured payload
     result = parse_tool_calls(wrapped_raw_content, tools)
 
-    content_source = result["content"] if result["tools_called"] else wrapped_raw_content
-    content_source = ensure_think_wrapped(content_source) if content_source else ""
+    # Prefer backend-provided tool_calls over parsed ones
+    tool_calls = backend_tool_calls
+    if not tool_calls and result["tools_called"]:
+        tool_calls = result["tool_calls"]
+
+    # Extract content without tool blocks
+    content_without_tool_blocks = wrapped_raw_content
+    if result["tools_called"] and result["content"]:
+        content_without_tool_blocks = ensure_think_wrapped(result["content"])
+    elif result["tools_called"] and not result["content"]:
+        content_without_tool_blocks = ""
+
+    content_source = content_without_tool_blocks
 
     thinking_text = ""
     visible_text = content_source
     if settings.enable_anthropic_thinking_blocks:
-        thinking_text, visible_text = split_think(content_source)
+        wrapped_for_split = ensure_think_wrapped(content_without_tool_blocks)
+        thinking_text, visible_text = split_think(wrapped_for_split)
     else:
+        thinking_text = reasoning_text.strip() if reasoning_text else ""
         visible_text = content_source
 
     if not (visible_text and visible_text.strip()) and choice_payload.get("finish_reason") == "length":
@@ -822,7 +858,7 @@ async def complete_anthropic_response(anthropic_request: AnthropicChatRequest, s
     # Format as Anthropic response
     formatted = anthropic_formatter.format_complete_response(
         content=visible_text,
-        tool_calls=result["tool_calls"] if result["tools_called"] else None,
+        tool_calls=tool_calls,
         model=anthropic_request.model,
         thinking_text=thinking_text if settings.enable_anthropic_thinking_blocks else None,
         usage=usage,
@@ -831,10 +867,14 @@ async def complete_anthropic_response(anthropic_request: AnthropicChatRequest, s
     if session_id:
         assistant_message: Dict[str, Any] = {
             "role": "assistant",
-            "content": wrapped_raw_content,
+            "content": ensure_think_wrapped(raw_content),
         }
-        if result["tools_called"]:
-            assistant_message["tool_calls"] = result["tool_calls"]
+        if tool_calls:
+            assistant_message["tool_calls"] = tool_calls
+        if thinking_text and settings.enable_anthropic_thinking_blocks:
+            assistant_message["reasoning_details"] = [
+                {"type": "chain_of_thought", "text": thinking_text}
+            ]
         session_store.append_message(session_id, assistant_message)
 
     return formatted
