@@ -46,8 +46,11 @@ class Settings(BaseSettings):
         "你", "他", "们", "来", "到", "时", "要", "就", "会", "可", "那", "些"
     ]
 
+    # Model detection
+    minimax_model_patterns: list[str] = ["minimax", "m2"]  # Model name patterns that use MiniMax format
+
     # Logging
-    log_level: str = "INFO"
+    log_level: str = "DEBUG"
     log_raw_responses: bool = False  # Log raw backend responses (debug)
     enable_streaming_debug: bool = False  # Emit detailed streaming traces for troubleshooting
     streaming_debug_path: Optional[str] = None  # Optional file path for streaming trace logs

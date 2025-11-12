@@ -55,6 +55,11 @@ class TabbyClient:
             f"{self.base_url}/v1/chat/completions",
             json=payload
         )
+        if response.status_code != 200:
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.error(f"Backend returned {response.status_code}: {response.text}")
+            logger.error(f"Payload sent: {payload}")
         response.raise_for_status()
         return response.json()
 
@@ -84,6 +89,10 @@ class TabbyClient:
             "stream": True,
             **filtered_kwargs
         }
+
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.info(f"Streaming to TabbyAPI - max_tokens: {payload.get('max_tokens')}, thinking: {payload.get('thinking')}")
 
         async with self.client.stream(
             "POST",

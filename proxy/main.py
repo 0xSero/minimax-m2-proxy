@@ -20,6 +20,7 @@ from .models import (
     OpenAIChatRequest,
     anthropic_messages_to_openai,
     anthropic_tools_to_openai,
+    anthropic_tool_choice_to_openai,
 )
 from formatters.anthropic import AnthropicFormatter
 from formatters.openai import OpenAIFormatter
@@ -36,6 +37,13 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 stream_logger = logging.getLogger("minimax.streaming")
+
+
+def is_minimax_model(model_name: str) -> bool:
+    """Check if model uses MiniMax XML format"""
+    model_lower = model_name.lower()
+    return any(pattern.lower() in model_lower for pattern in settings.minimax_model_patterns)
+
 
 if settings.enable_streaming_debug:
     stream_logger.setLevel(logging.DEBUG)
@@ -208,6 +216,29 @@ async def complete_openai_response(chat_request: OpenAIChatRequest, session_id: 
     # Convert messages to dict
     messages = [msg.model_dump(exclude_none=True) for msg in chat_request.messages]
 
+    # Check if this is a MiniMax model that needs XML parsing
+    use_minimax_parsing = is_minimax_model(chat_request.model)
+
+    if not use_minimax_parsing:
+        logger.info(f"Non-MiniMax model detected: {chat_request.model}, passing through without XML parsing")
+        # Pass through directly to backend without any normalization or parsing
+        tools = None
+        if chat_request.tools:
+            tools = [tool.model_dump(exclude_none=True) for tool in chat_request.tools]
+
+        response = await tabby_client.chat_completion(
+            messages=messages,
+            model=chat_request.model,
+            max_tokens=chat_request.max_tokens,
+            temperature=chat_request.temperature,
+            top_p=chat_request.top_p,
+            top_k=chat_request.top_k,
+            stop=chat_request.stop,
+            tools=tools,
+            tool_choice=chat_request.tool_choice,
+        )
+        return response
+
     repair_result: RepairResult = session_store.inject_or_repair(
         messages,
         session_id,
@@ -336,6 +367,35 @@ async def stream_openai_response(chat_request: OpenAIChatRequest, session_id: Op
 
     # Convert messages to dict
     messages = [msg.model_dump(exclude_none=True) for msg in chat_request.messages]
+
+    # Check if this is a MiniMax model that needs XML parsing
+    use_minimax_parsing = is_minimax_model(chat_request.model)
+
+    if not use_minimax_parsing:
+        logger.info(f"Non-MiniMax model detected (streaming): {chat_request.model}, passing through without XML parsing")
+        # Pass through directly to backend without any normalization or parsing
+        tools = None
+        if chat_request.tools:
+            tools = [tool.model_dump(exclude_none=True) for tool in chat_request.tools]
+
+        try:
+            async for line in tabby_client.chat_completion_stream(
+                messages=messages,
+                model=chat_request.model,
+                max_tokens=chat_request.max_tokens,
+                temperature=chat_request.temperature,
+                top_p=chat_request.top_p,
+                top_k=chat_request.top_k,
+                stop=chat_request.stop,
+                tools=tools,
+                tool_choice=chat_request.tool_choice,
+            ):
+                yield line + "\n"
+        except Exception as e:
+            logger.error(f"Error in OpenAI streaming (pass-through): {e}", exc_info=True)
+            error_chunk = openai_formatter.format_error(str(e))
+            yield f"data: {json.dumps(error_chunk)}\n\n"
+        return
 
     repair_result: RepairResult = session_store.inject_or_repair(
         messages,
@@ -736,6 +796,54 @@ async def complete_anthropic_response(anthropic_request: AnthropicChatRequest, s
         system_content = anthropic_request.system if isinstance(anthropic_request.system, str) else str(anthropic_request.system)
         openai_messages.insert(0, {"role": "system", "content": system_content})
 
+    # Check if this is a MiniMax model that needs XML parsing
+    use_minimax_parsing = is_minimax_model(anthropic_request.model)
+
+    # For MiniMax models, ensure max_tokens is high enough to avoid thinking-only responses
+    effective_max_tokens = anthropic_request.max_tokens
+    logger.info(f"Anthropic request - model: {anthropic_request.model}, max_tokens: {effective_max_tokens}, stream: {anthropic_request.stream}, use_minimax_parsing: {use_minimax_parsing}")
+    if use_minimax_parsing and effective_max_tokens <= 8192:
+        logger.info(f"Increasing max_tokens from {effective_max_tokens} to 32768 for MiniMax model")
+        effective_max_tokens = 32768
+
+    if not use_minimax_parsing:
+        logger.info(f"Non-MiniMax model detected (Anthropic): {anthropic_request.model}, passing through without XML parsing")
+        # Pass through to backend and format as Anthropic response
+        tools = anthropic_tools_to_openai(anthropic_request.tools)
+        tool_choice = anthropic_tool_choice_to_openai(anthropic_request.tool_choice)
+
+        response = await tabby_client.chat_completion(
+            messages=openai_messages,
+            model=anthropic_request.model,
+            max_tokens=effective_max_tokens,
+            temperature=anthropic_request.temperature,
+            top_p=anthropic_request.top_p,
+            top_k=anthropic_request.top_k,
+            stop=anthropic_request.stop_sequences,
+            tools=tools,
+            tool_choice=tool_choice,
+        )
+
+        # Convert OpenAI response to Anthropic format
+        message_payload = response["choices"][0]["message"]
+        content = message_payload.get("content", "") or ""
+        tool_calls = message_payload.get("tool_calls")
+
+        usage = response.get("usage", {"input_tokens": 0, "output_tokens": 0})
+        if "prompt_tokens" in usage:
+            usage = {
+                "input_tokens": usage.get("prompt_tokens", 0),
+                "output_tokens": usage.get("completion_tokens", 0)
+            }
+
+        return anthropic_formatter.format_complete_response(
+            content=content,
+            tool_calls=tool_calls,
+            model=anthropic_request.model,
+            thinking_text=None,
+            usage=usage,
+        )
+
     repair_result: RepairResult = session_store.inject_or_repair(
         openai_messages,
         session_id,
@@ -757,6 +865,7 @@ async def complete_anthropic_response(anthropic_request: AnthropicChatRequest, s
 
     # Convert tools
     tools = anthropic_tools_to_openai(anthropic_request.tools)
+    tool_choice = anthropic_tool_choice_to_openai(anthropic_request.tool_choice)
 
     # Debug logging
     import pprint
@@ -764,21 +873,27 @@ async def complete_anthropic_response(anthropic_request: AnthropicChatRequest, s
     for i, msg in enumerate(openai_messages):
         logger.debug(f"  Message {i}: role={msg.get('role')}, content_len={len(str(msg.get('content', '')))}, has_tool_calls={bool(msg.get('tool_calls'))}")
 
-    thinking_payload = anthropic_request.thinking or {
-        "max_thinking_tokens": settings.anthropic_default_thinking_tokens
-    }
+    # Configure thinking tokens - always send for MiniMax to unlock full generation
+    if anthropic_request.thinking:
+        thinking_payload = anthropic_request.thinking
+    elif use_minimax_parsing:
+        # For MiniMax, send a very high thinking limit - model uses thinking extensively
+        # Use half of max_tokens for thinking to leave room for content
+        thinking_payload = {"max_thinking_tokens": min(effective_max_tokens // 2, 32768)}
+    else:
+        thinking_payload = None
 
     # Call TabbyAPI
     response = await tabby_client.chat_completion(
         messages=normalized_messages,
         model=anthropic_request.model,
-        max_tokens=anthropic_request.max_tokens,
+        max_tokens=effective_max_tokens,
         temperature=anthropic_request.temperature,
         top_p=anthropic_request.top_p,
         top_k=anthropic_request.top_k,
         stop=anthropic_request.stop_sequences,
         tools=tools,
-        tool_choice=anthropic_request.tool_choice,
+        tool_choice=tool_choice,
         add_generation_prompt=True,  # Required for <think> tags
         banned_strings=settings.banned_chinese_strings if settings.enable_chinese_char_blocking else None,
         thinking=thinking_payload,
@@ -891,6 +1006,107 @@ async def stream_anthropic_response(anthropic_request: AnthropicChatRequest, ses
         system_content = anthropic_request.system if isinstance(anthropic_request.system, str) else str(anthropic_request.system)
         openai_messages.insert(0, {"role": "system", "content": system_content})
 
+    # Check if this is a MiniMax model that needs XML parsing
+    use_minimax_parsing = is_minimax_model(anthropic_request.model)
+
+    # For MiniMax models, ensure max_tokens is high enough to avoid thinking-only responses
+    effective_max_tokens = anthropic_request.max_tokens
+    logger.info(f"Anthropic streaming request - model: {anthropic_request.model}, max_tokens: {effective_max_tokens}, use_minimax_parsing: {use_minimax_parsing}")
+    if use_minimax_parsing and effective_max_tokens <= 8192:
+        logger.info(f"Increasing max_tokens from {effective_max_tokens} to 32768 for MiniMax model (streaming)")
+        effective_max_tokens = 32768
+
+    if not use_minimax_parsing:
+        logger.info(f"Non-MiniMax model detected (Anthropic/streaming): {anthropic_request.model}, passing through without XML parsing")
+        # Pass through and convert OpenAI stream to Anthropic format
+        tools = anthropic_tools_to_openai(anthropic_request.tools)
+        tool_choice = anthropic_tool_choice_to_openai(anthropic_request.tool_choice)
+
+        try:
+            # Send message_start
+            yield anthropic_formatter.format_message_start(anthropic_request.model)
+
+            # Start first content block
+            content_block_index = 0
+            content_block_started = False
+            tool_calls_buffer: Dict[int, Dict[str, Any]] = {}
+
+            async for chunk in tabby_client.extract_streaming_content(
+                messages=openai_messages,
+                model=anthropic_request.model,
+                max_tokens=effective_max_tokens,
+                temperature=anthropic_request.temperature,
+                top_p=anthropic_request.top_p,
+                top_k=anthropic_request.top_k,
+                stop=anthropic_request.stop_sequences,
+                tools=tools,
+                tool_choice=tool_choice,
+            ):
+                if "choices" in chunk and len(chunk["choices"]) > 0:
+                    choice = chunk["choices"][0]
+                    delta = choice.get("delta", {})
+                    content_delta = delta.get("content", "")
+                    tool_calls_delta = delta.get("tool_calls")
+
+                    if content_delta:
+                        if not content_block_started:
+                            yield anthropic_formatter.format_content_block_start(content_block_index, "text")
+                            content_block_started = True
+                        yield anthropic_formatter.format_content_block_delta(
+                            content_block_index,
+                            content_delta,
+                            delta_type="text_delta"
+                        )
+
+                    if tool_calls_delta:
+                        # Buffer tool calls
+                        for tc_delta in tool_calls_delta:
+                            idx = tc_delta.get("index", 0)
+                            if idx not in tool_calls_buffer:
+                                tool_calls_buffer[idx] = {
+                                    "id": tc_delta.get("id", ""),
+                                    "type": "function",
+                                    "function": {"name": "", "arguments": ""}
+                                }
+                            if "id" in tc_delta and tc_delta["id"]:
+                                tool_calls_buffer[idx]["id"] = tc_delta["id"]
+                            if "function" in tc_delta:
+                                fn = tc_delta["function"]
+                                if "name" in fn:
+                                    tool_calls_buffer[idx]["function"]["name"] = fn["name"]
+                                if "arguments" in fn:
+                                    tool_calls_buffer[idx]["function"]["arguments"] += fn["arguments"]
+
+                    finish_reason = choice.get("finish_reason")
+                    if finish_reason:
+                        # Close text block if open
+                        if content_block_started:
+                            yield anthropic_formatter.format_content_block_stop(content_block_index)
+                            content_block_index += 1
+
+                        # Send tool calls
+                        for idx in sorted(tool_calls_buffer.keys()):
+                            tool_call = tool_calls_buffer[idx]
+                            yield anthropic_formatter.format_tool_use_delta(content_block_index, tool_call)
+                            yield anthropic_formatter.format_content_block_stop(content_block_index)
+                            content_block_index += 1
+
+                        # Map finish reason
+                        stop_reason = "end_turn" if finish_reason == "stop" else finish_reason
+                        if finish_reason == "tool_calls":
+                            stop_reason = "tool_use"
+
+                        yield anthropic_formatter.format_message_delta(stop_reason)
+                        break
+
+            yield anthropic_formatter.format_message_stop()
+
+        except Exception as e:
+            logger.error(f"Error in Anthropic streaming (pass-through): {e}", exc_info=True)
+            error_response = anthropic_formatter.format_error(str(e))
+            yield f"data: {json.dumps(error_response)}\n\n"
+        return
+
     repair_result: RepairResult = session_store.inject_or_repair(
         openai_messages,
         session_id,
@@ -912,16 +1128,23 @@ async def stream_anthropic_response(anthropic_request: AnthropicChatRequest, ses
 
     # Convert tools
     tools = anthropic_tools_to_openai(anthropic_request.tools)
+    tool_choice = anthropic_tool_choice_to_openai(anthropic_request.tool_choice)
 
     # Initialize streaming parser
     streaming_parser = StreamingParser()
     streaming_parser.set_tools(tools)
-    captured_tool_calls: Optional[list[Dict[str, Any]]] = None
+    captured_tool_calls: Optional[Dict[int, Dict[str, Any]]] = None
     thinking_block_started = False
     text_emitted = False
-    thinking_payload = anthropic_request.thinking or {
-        "max_thinking_tokens": settings.anthropic_default_thinking_tokens
-    }
+    # Configure thinking tokens - always send for MiniMax to unlock full generation
+    if anthropic_request.thinking:
+        thinking_payload = anthropic_request.thinking
+    elif use_minimax_parsing:
+        # For MiniMax, send a very high thinking limit - model uses thinking extensively
+        # Use half of max_tokens for thinking to leave room for content
+        thinking_payload = {"max_thinking_tokens": min(effective_max_tokens // 2, 32768)}
+    else:
+        thinking_payload = None
 
     try:
         # Send message_start
@@ -935,13 +1158,13 @@ async def stream_anthropic_response(anthropic_request: AnthropicChatRequest, ses
         async for chunk in tabby_client.extract_streaming_content(
             messages=normalized_messages,
             model=anthropic_request.model,
-            max_tokens=anthropic_request.max_tokens,
+            max_tokens=effective_max_tokens,
             temperature=anthropic_request.temperature,
             top_p=anthropic_request.top_p,
             top_k=anthropic_request.top_k,
             stop=anthropic_request.stop_sequences,
             tools=tools,
-            tool_choice=anthropic_request.tool_choice,
+            tool_choice=tool_choice,
             add_generation_prompt=True,  # Required for <think> tags
             banned_strings=settings.banned_chinese_strings if settings.enable_chinese_char_blocking else None,
             thinking=thinking_payload,
@@ -950,9 +1173,80 @@ async def stream_anthropic_response(anthropic_request: AnthropicChatRequest, ses
             if "choices" in chunk and len(chunk["choices"]) > 0:
                 choice = chunk["choices"][0]
                 delta = choice.get("delta", {})
+                reasoning_delta = delta.get("reasoning_content", "")
                 content_delta = delta.get("content", "")
+                tool_calls_delta = delta.get("tool_calls")
+
+                # Handle structured reasoning_content field from TabbyAPI
+                if reasoning_delta and settings.enable_anthropic_thinking_blocks:
+                    if not thinking_block_started:
+                        yield anthropic_formatter.format_content_block_start(content_block_index, "thinking")
+                        thinking_block_started = True
+                    yield anthropic_formatter.format_content_block_delta(
+                        content_block_index,
+                        reasoning_delta,
+                        delta_type="thinking_delta",
+                    )
 
                 if content_delta:
+                    # Close thinking block if we're starting content
+                    if thinking_block_started and settings.enable_anthropic_thinking_blocks:
+                        yield anthropic_formatter.format_content_block_stop(content_block_index)
+                        content_block_index += 1
+                        thinking_block_started = False
+
+                    # Start text block if not started
+                    if not content_block_started:
+                        yield anthropic_formatter.format_content_block_start(content_block_index, "text")
+                        content_block_started = True
+
+                    # Send content delta
+                    yield anthropic_formatter.format_content_block_delta(
+                        content_block_index,
+                        content_delta,
+                        delta_type="text_delta"
+                    )
+                    text_emitted = True
+
+                # Handle tool calls
+                if tool_calls_delta:
+                    logger.debug(f"Received tool_calls_delta: {tool_calls_delta}")
+
+                    # Close any open blocks
+                    if content_block_started:
+                        yield anthropic_formatter.format_content_block_stop(content_block_index)
+                        content_block_index += 1
+                        content_block_started = False
+                    if thinking_block_started:
+                        yield anthropic_formatter.format_content_block_stop(content_block_index)
+                        content_block_index += 1
+                        thinking_block_started = False
+
+                    # Initialize captured_tool_calls if needed
+                    if captured_tool_calls is None:
+                        captured_tool_calls = {}
+
+                    # Buffer tool calls until complete
+                    for tc_delta in tool_calls_delta:
+                        idx = tc_delta.get("index", 0)
+                        if idx not in captured_tool_calls:
+                            captured_tool_calls[idx] = {
+                                "id": "",
+                                "type": "function",
+                                "function": {"name": "", "arguments": ""}
+                            }
+                        if "id" in tc_delta:
+                            captured_tool_calls[idx]["id"] = tc_delta["id"]
+                        if "function" in tc_delta:
+                            fn = tc_delta["function"]
+                            if "name" in fn:
+                                captured_tool_calls[idx]["function"]["name"] = fn["name"]
+                            if "arguments" in fn:
+                                logger.debug(f"Adding arguments: '{fn['arguments']}' to tool {captured_tool_calls[idx]['function']['name']}")
+                                captured_tool_calls[idx]["function"]["arguments"] += fn["arguments"]
+
+                # OLD PARSER-BASED LOGIC (keeping for fallback)
+                if content_delta and False:  # Disabled
                     # Process with streaming parser to preserve <think> blocks
                     # Note: Parser will handle prepending <think> tag when it detects </think>
                     parsed = streaming_parser.process_chunk(content_delta)
@@ -1012,9 +1306,38 @@ async def stream_anthropic_response(anthropic_request: AnthropicChatRequest, ses
                     # Close last content block if open
                     if content_block_started:
                         yield anthropic_formatter.format_content_block_stop(content_block_index)
+                        content_block_started = False
+                    if thinking_block_started:
+                        yield anthropic_formatter.format_content_block_stop(content_block_index)
+                        thinking_block_started = False
+
+                    # Emit buffered tool calls if any
+                    if captured_tool_calls:
+                        for idx in sorted(captured_tool_calls.keys()):
+                            tool_call = captured_tool_calls[idx]
+                            # Debug logging
+                            logger.info(f"Emitting tool call: {tool_call['function']['name']}, args: {tool_call['function']['arguments'][:100] if tool_call['function']['arguments'] else 'EMPTY'}")
+
+                            # Send tool_use start with empty input
+                            yield anthropic_formatter.format_tool_use_start(
+                                content_block_index,
+                                tool_call["id"],
+                                tool_call["function"]["name"]
+                            )
+
+                            # Send the arguments as input_json_delta
+                            if tool_call["function"]["arguments"]:
+                                yield anthropic_formatter.format_tool_input_delta(
+                                    content_block_index,
+                                    tool_call["function"]["arguments"]
+                                )
+
+                            # Close the tool_use block
+                            yield anthropic_formatter.format_content_block_stop(content_block_index)
+                            content_block_index += 1
 
                     # Override finish_reason if tool calls were detected
-                    if finish_reason == "stop" and streaming_parser.has_tool_calls():
+                    if finish_reason == "stop" and (captured_tool_calls or streaming_parser.has_tool_calls()):
                         finish_reason = "tool_calls"
 
                     # Map finish reason

@@ -139,17 +139,31 @@ class AnthropicFormatter:
         )
 
     @staticmethod
-    def format_tool_use_delta(index: int, tool_call: Dict[str, Any]) -> str:
-        """Format tool_use block"""
+    def format_tool_use_start(index: int, tool_id: str, tool_name: str) -> str:
+        """Format tool_use content_block_start with empty input"""
         return AnthropicFormatter.format_streaming_event(
             "content_block_start",
             {
                 "index": index,
                 "content_block": {
                     "type": "tool_use",
-                    "id": tool_call["id"],
-                    "name": tool_call["function"]["name"],
-                    "input": json.loads(tool_call["function"]["arguments"])
+                    "id": tool_id,
+                    "name": tool_name,
+                    "input": {}  # Empty - will be filled by input_json_delta
+                }
+            }
+        )
+
+    @staticmethod
+    def format_tool_input_delta(index: int, partial_json: str) -> str:
+        """Format input_json_delta event for tool arguments"""
+        return AnthropicFormatter.format_streaming_event(
+            "content_block_delta",
+            {
+                "index": index,
+                "delta": {
+                    "type": "input_json_delta",
+                    "partial_json": partial_json
                 }
             }
         )

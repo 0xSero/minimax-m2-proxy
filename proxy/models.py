@@ -45,7 +45,7 @@ class OpenAIChatRequest(BaseModel):
     """OpenAI Chat Completions request"""
     model: str = "minimax-m2"
     messages: List[OpenAIMessage]
-    max_tokens: Optional[int] = Field(None, ge=1)
+    max_tokens: Optional[int] = Field(180000, ge=1)
     temperature: Optional[float] = Field(1.0, gt=0.0, le=1.0)
     top_p: Optional[float] = Field(1.0, ge=0.0, le=1.0)
     top_k: Optional[int] = Field(None, ge=0)
@@ -66,7 +66,7 @@ class AnthropicContentBlock(BaseModel):
     source: Optional[Dict[str, Any]] = None  # For image
     id: Optional[str] = None  # For tool_use
     name: Optional[str] = None  # For tool_use
-    input: Optional[Dict[str, Any]] = None  # For tool_use
+    input: Optional[Union[Dict[str, Any], str]] = None  # For tool_use - can be dict or empty string
     tool_use_id: Optional[str] = None  # For tool_result
     content: Optional[Union[str, List[Dict[str, Any]]]] = None  # For tool_result
 
@@ -88,7 +88,7 @@ class AnthropicChatRequest(BaseModel):
     """Anthropic Messages request"""
     model: str = "minimax-m2"
     messages: List[AnthropicMessage]
-    max_tokens: int = Field(4096, ge=1)
+    max_tokens: int = Field(180000, ge=1)
     system: Optional[Union[str, List[Dict[str, Any]]]] = None
     temperature: Optional[float] = Field(1.0, gt=0.0, le=1.0)
     top_p: Optional[float] = Field(None, ge=0.0, le=1.0)
@@ -117,6 +117,46 @@ def anthropic_tools_to_openai(tools: Optional[List[AnthropicTool]]) -> Optional[
             }
         })
     return openai_tools
+
+
+def anthropic_tool_choice_to_openai(tool_choice: Optional[Union[str, Dict[str, Any]]]) -> Optional[Union[str, Dict[str, Any]]]:
+    """Convert Anthropic tool_choice to OpenAI format
+
+    Anthropic formats:
+    - {"type": "auto"} -> "auto"
+    - {"type": "any"} -> "required"
+    - {"type": "tool", "name": "foo"} -> {"type": "function", "function": {"name": "foo"}}
+
+    OpenAI formats:
+    - "auto" (default) - model decides
+    - "required" - must call a tool
+    - "none" - no tools
+    - {"type": "function", "function": {"name": "foo"}} - specific tool
+    """
+    if not tool_choice:
+        return None
+
+    if isinstance(tool_choice, str):
+        # Already in OpenAI format
+        return tool_choice
+
+    if isinstance(tool_choice, dict):
+        choice_type = tool_choice.get("type")
+
+        if choice_type == "auto":
+            return "auto"
+        elif choice_type == "any":
+            return "required"
+        elif choice_type == "tool":
+            # Specific tool
+            tool_name = tool_choice.get("name")
+            if tool_name:
+                return {
+                    "type": "function",
+                    "function": {"name": tool_name}
+                }
+
+    return None
 
 
 def _serialize_tool_arguments(input_payload: Optional[Union[str, Dict[str, Any], List[Any]]]) -> str:
