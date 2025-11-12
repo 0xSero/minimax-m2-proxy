@@ -803,8 +803,8 @@ async def complete_anthropic_response(anthropic_request: AnthropicChatRequest, s
     effective_max_tokens = anthropic_request.max_tokens
     logger.info(f"Anthropic request - model: {anthropic_request.model}, max_tokens: {effective_max_tokens}, stream: {anthropic_request.stream}, use_minimax_parsing: {use_minimax_parsing}")
     if use_minimax_parsing and effective_max_tokens <= 8192:
-        logger.info(f"Increasing max_tokens from {effective_max_tokens} to 32768 for MiniMax model")
-        effective_max_tokens = 32768
+        logger.info(f"Increasing max_tokens from {effective_max_tokens} to 180000 for MiniMax model")
+        effective_max_tokens = 180000
 
     if not use_minimax_parsing:
         logger.info(f"Non-MiniMax model detected (Anthropic): {anthropic_request.model}, passing through without XML parsing")
@@ -1013,8 +1013,8 @@ async def stream_anthropic_response(anthropic_request: AnthropicChatRequest, ses
     effective_max_tokens = anthropic_request.max_tokens
     logger.info(f"Anthropic streaming request - model: {anthropic_request.model}, max_tokens: {effective_max_tokens}, use_minimax_parsing: {use_minimax_parsing}")
     if use_minimax_parsing and effective_max_tokens <= 8192:
-        logger.info(f"Increasing max_tokens from {effective_max_tokens} to 32768 for MiniMax model (streaming)")
-        effective_max_tokens = 32768
+        logger.info(f"Increasing max_tokens from {effective_max_tokens} to 180000 for MiniMax model (streaming)")
+        effective_max_tokens = 180000
 
     if not use_minimax_parsing:
         logger.info(f"Non-MiniMax model detected (Anthropic/streaming): {anthropic_request.model}, passing through without XML parsing")
