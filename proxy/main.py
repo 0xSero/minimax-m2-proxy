@@ -802,9 +802,18 @@ async def complete_anthropic_response(anthropic_request: AnthropicChatRequest, s
     # For MiniMax models, ensure max_tokens is high enough to avoid thinking-only responses
     effective_max_tokens = anthropic_request.max_tokens
     logger.info(f"Anthropic request - model: {anthropic_request.model}, max_tokens: {effective_max_tokens}, stream: {anthropic_request.stream}, use_minimax_parsing: {use_minimax_parsing}")
-    if use_minimax_parsing and effective_max_tokens <= 8192:
-        logger.info(f"Increasing max_tokens from {effective_max_tokens} to 180000 for MiniMax model")
-        effective_max_tokens = 180000
+    if use_minimax_parsing:
+        # CRITICAL FIX: Cap max_tokens to prevent CUDA OOM!
+        # MiniMax-M2 (456B MoE) has huge KV cache requirements
+        # TabbyAPI pre-allocates VRAM for max_tokens before generation
+        # Even 32k tokens causes OOM with this model size
+        # Safe limit: 8192 tokens for generation (enough for most responses)
+        if effective_max_tokens <= 4096:
+            logger.info(f"Increasing max_tokens from {effective_max_tokens} to 8192 for MiniMax model")
+            effective_max_tokens = 8192
+        elif effective_max_tokens > 8192:
+            logger.info(f"Capping max_tokens from {effective_max_tokens} to 8192 to prevent CUDA OOM")
+            effective_max_tokens = 8192
 
     if not use_minimax_parsing:
         logger.info(f"Non-MiniMax model detected (Anthropic): {anthropic_request.model}, passing through without XML parsing")
@@ -879,7 +888,8 @@ async def complete_anthropic_response(anthropic_request: AnthropicChatRequest, s
     elif use_minimax_parsing:
         # For MiniMax, send a very high thinking limit - model uses thinking extensively
         # Use half of max_tokens for thinking to leave room for content
-        thinking_payload = {"max_thinking_tokens": min(effective_max_tokens // 2, 32768)}
+        # Allow up to half of max_tokens for thinking, no cap
+        thinking_payload = {"max_thinking_tokens": effective_max_tokens // 2}
     else:
         thinking_payload = None
 
@@ -1011,10 +1021,19 @@ async def stream_anthropic_response(anthropic_request: AnthropicChatRequest, ses
 
     # For MiniMax models, ensure max_tokens is high enough to avoid thinking-only responses
     effective_max_tokens = anthropic_request.max_tokens
-    logger.info(f"Anthropic streaming request - model: {anthropic_request.model}, max_tokens: {effective_max_tokens}, use_minimax_parsing: {use_minimax_parsing}")
-    if use_minimax_parsing and effective_max_tokens <= 8192:
-        logger.info(f"Increasing max_tokens from {effective_max_tokens} to 180000 for MiniMax model (streaming)")
-        effective_max_tokens = 180000
+    logger.info(f"Anthropic streaming request - model: {anthropic_request.model}, max_tokens: {effective_max_tokens}, message_count: {len(anthropic_request.messages)}, use_minimax_parsing: {use_minimax_parsing}")
+    if use_minimax_parsing:
+        # CRITICAL FIX: Cap max_tokens to prevent CUDA OOM!
+        # MiniMax-M2 (456B MoE) has huge KV cache requirements
+        # TabbyAPI pre-allocates VRAM for max_tokens before generation
+        # Even 32k tokens causes OOM with this model size
+        # Safe limit: 8192 tokens for generation (enough for most responses)
+        if effective_max_tokens <= 4096:
+            logger.info(f"Increasing max_tokens from {effective_max_tokens} to 8192 for MiniMax model (streaming)")
+            effective_max_tokens = 8192
+        elif effective_max_tokens > 8192:
+            logger.info(f"Capping max_tokens from {effective_max_tokens} to 8192 to prevent CUDA OOM (streaming)")
+            effective_max_tokens = 8192
 
     if not use_minimax_parsing:
         logger.info(f"Non-MiniMax model detected (Anthropic/streaming): {anthropic_request.model}, passing through without XML parsing")
@@ -1126,6 +1145,12 @@ async def stream_anthropic_response(anthropic_request: AnthropicChatRequest, ses
     openai_messages = repair_result.messages
     normalized_messages = normalize_openai_history(openai_messages)
 
+    # Debug: Log message structure
+    logger.info(f"Sending {len(normalized_messages)} messages to TabbyAPI")
+    for i, msg in enumerate(normalized_messages):
+        msg_preview = str(msg)[:200] if len(str(msg)) > 200 else str(msg)
+        logger.debug(f"  Message {i}: {msg_preview}...")
+
     # Convert tools
     tools = anthropic_tools_to_openai(anthropic_request.tools)
     tool_choice = anthropic_tool_choice_to_openai(anthropic_request.tool_choice)
@@ -1142,7 +1167,8 @@ async def stream_anthropic_response(anthropic_request: AnthropicChatRequest, ses
     elif use_minimax_parsing:
         # For MiniMax, send a very high thinking limit - model uses thinking extensively
         # Use half of max_tokens for thinking to leave room for content
-        thinking_payload = {"max_thinking_tokens": min(effective_max_tokens // 2, 32768)}
+        # Allow up to half of max_tokens for thinking, no cap
+        thinking_payload = {"max_thinking_tokens": effective_max_tokens // 2}
     else:
         thinking_payload = None
 
