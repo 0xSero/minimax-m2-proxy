@@ -25,6 +25,23 @@ def ensure_think_wrapped(text: str) -> str:
     return f"{prefix}<think>\n{stripped}"
 
 
+def strip_enclosing_think(text: str) -> str:
+    """
+    Remove a surrounding <think>…</think> block if the string is fully wrapped.
+    """
+    if not text:
+        return text
+
+    stripped = text.strip()
+    opening = "<think>"
+    closing = "</think>"
+
+    if stripped.startswith(opening) and stripped.endswith(closing):
+        return stripped[len(opening):-len(closing)].strip()
+
+    return text
+
+
 def split_think(text: str) -> Tuple[str, str]:
     """
     Split thinking content (inside <think>...</think>) from visible content.
