@@ -7,7 +7,7 @@ https://platform.minimax.io/docs/guides/text-m2-function-call
 import json
 import re
 import uuid
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 
 def _format_param_value_for_xml(value: Any) -> str:
@@ -210,3 +210,59 @@ def parse_tool_calls(model_output: str, tools: Optional[List[Dict]] = None) -> D
         "tool_calls": tool_calls,
         "content": content if content else None
     }
+
+
+def extract_json_tool_calls(model_output: str) -> Tuple[str, Optional[List[Dict[str, Any]]]]:
+    """
+    Detect and extract trailing JSON tool call payloads at the end of the response content.
+    Returns the content without the JSON snippet and the parsed OpenAI-style tool calls.
+    """
+    if not model_output:
+        return model_output, None
+
+    trimmed = model_output.rstrip()
+    if not trimmed.endswith("]"):
+        return model_output, None
+
+    start_idx = trimmed.rfind("[")
+    if start_idx == -1:
+        return model_output, None
+
+    candidate = trimmed[start_idx:]
+    try:
+        parsed = json.loads(candidate)
+    except json.JSONDecodeError:
+        return model_output, None
+
+    if not isinstance(parsed, list) or not parsed:
+        return model_output, None
+
+    tool_calls: List[Dict[str, Any]] = []
+    for entry in parsed:
+        if not isinstance(entry, dict):
+            return model_output, None
+
+        name = entry.get("name")
+        if not isinstance(name, str) or not name.strip():
+            return model_output, None
+
+        parameters = entry.get("parameters") or entry.get("args") or {}
+        if isinstance(parameters, str):
+            try:
+                parameters = json.loads(parameters)
+            except json.JSONDecodeError:
+                parameters = entry.get("parameters") or {}
+
+        arguments = json.dumps(parameters if parameters is not None else {}, ensure_ascii=False)
+
+        tool_calls.append({
+            "id": f"call_{uuid.uuid4().hex[:24]}",
+            "type": "function",
+            "function": {
+                "name": name,
+                "arguments": arguments
+            }
+        })
+
+    clean_content = trimmed[:start_idx].rstrip()
+    return clean_content, tool_calls

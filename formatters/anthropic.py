@@ -169,6 +169,21 @@ class AnthropicFormatter:
         )
 
     @staticmethod
+    def format_tool_use_delta(index: int, tool_call: Dict[str, Any]) -> str:
+        """Convenience helper to emit a tool_use block (start + arguments)."""
+        events: List[str] = []
+        tool_id = tool_call.get("id") or ""
+        tool_name = tool_call.get("function", {}).get("name") or ""
+        events.append(AnthropicFormatter.format_tool_use_start(index, tool_id, tool_name))
+
+        arguments = tool_call.get("function", {}).get("arguments")
+        if arguments:
+            events.append(AnthropicFormatter.format_tool_input_delta(index, arguments))
+
+        return "".join(events)
+
+
+    @staticmethod
     def format_content_block_stop(index: int) -> str:
         """Format content_block_stop event"""
         return AnthropicFormatter.format_streaming_event(

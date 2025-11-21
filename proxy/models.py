@@ -45,7 +45,7 @@ class OpenAIChatRequest(BaseModel):
     """OpenAI Chat Completions request"""
     model: str = "minimax-m2"
     messages: List[OpenAIMessage]
-    max_tokens: Optional[int] = Field(180000, ge=1)
+    max_tokens: Optional[int] = Field(100000, ge=1)
     temperature: Optional[float] = Field(1.0, gt=0.0, le=1.0)
     top_p: Optional[float] = Field(1.0, ge=0.0, le=1.0)
     top_k: Optional[int] = Field(None, ge=0)
@@ -88,7 +88,7 @@ class AnthropicChatRequest(BaseModel):
     """Anthropic Messages request"""
     model: str = "minimax-m2"
     messages: List[AnthropicMessage]
-    max_tokens: int = Field(180000, ge=1)
+    max_tokens: int = Field(100000, ge=1)
     system: Optional[Union[str, List[Dict[str, Any]]]] = None
     temperature: Optional[float] = Field(1.0, gt=0.0, le=1.0)
     top_p: Optional[float] = Field(None, ge=0.0, le=1.0)
