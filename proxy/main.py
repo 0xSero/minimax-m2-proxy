@@ -5,6 +5,8 @@ Dual-API proxy supporting both OpenAI and Anthropic formats
 
 import json
 import logging
+import uuid
+from contextvars import ContextVar
 from contextlib import asynccontextmanager
 from typing import Any, AsyncIterator, Dict, List, Optional
 
@@ -30,10 +32,29 @@ from parsers.tools import parse_tool_calls, tool_calls_to_minimax_xml
 from .session_store import RepairResult, session_store
 
 
+request_id_var: ContextVar[str] = ContextVar("request_id", default="-")
+
+
+def _inject_request_id_factory() -> None:
+    record_factory = logging.getLogRecordFactory()
+    if getattr(record_factory, "_injects_request_id", False):
+        return
+
+    def record_factory_with_request_id(*args, **kwargs):
+        record = record_factory(*args, **kwargs)
+        record.request_id = request_id_var.get("-")
+        return record
+
+    record_factory_with_request_id._injects_request_id = True
+    logging.setLogRecordFactory(record_factory_with_request_id)
+
+
+_inject_request_id_factory()
+
 # Setup logging
 logging.basicConfig(
     level=settings.log_level,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    format='%(asctime)s - %(name)s - %(levelname)s - [req:%(request_id)s] %(message)s'
 )
 logger = logging.getLogger(__name__)
 stream_logger = logging.getLogger("minimax.streaming")
@@ -69,6 +90,18 @@ def _flatten_anthropic_system(system_content: Any) -> str:
             return "\n\n".join(part for part in parts if part)
         return _dump_for_log(system_content)
     return str(system_content)
+
+
+def _bind_request_id(stream: AsyncIterator[str], request_id: str) -> AsyncIterator[str]:
+    async def _wrapped() -> AsyncIterator[str]:
+        token = request_id_var.set(request_id)
+        try:
+            async for item in stream:
+                yield item
+        finally:
+            request_id_var.reset(token)
+
+    return _wrapped()
 
 
 if settings.enable_streaming_debug:
@@ -196,6 +229,19 @@ app = FastAPI(
     lifespan=lifespan
 )
 
+
+@app.middleware("http")
+async def request_id_middleware(request: Request, call_next):
+    header_id = request.headers.get("X-Request-Id")
+    request_id = header_id.strip() if header_id else uuid.uuid4().hex[:12]
+    token = request_id_var.set(request_id)
+    try:
+        response = await call_next(request)
+    finally:
+        request_id_var.reset(token)
+    response.headers["X-Request-Id"] = request_id
+    return response
+
 # Configure CORS
 app.add_middleware(
     CORSMiddleware,
@@ -222,8 +268,9 @@ async def openai_chat_completions(chat_request: OpenAIChatRequest, raw_request: 
             raise HTTPException(status_code=400, detail="Only n=1 is supported")
 
         if chat_request.stream:
+            request_id = request_id_var.get("-")
             return StreamingResponse(
-                stream_openai_response(chat_request, session_id),
+                _bind_request_id(stream_openai_response(chat_request, session_id), request_id),
                 media_type="text/event-stream"
             )
         else:
@@ -832,8 +879,9 @@ async def anthropic_messages(anthropic_request: AnthropicChatRequest, raw_reques
         session_id = extract_session_id(raw_request)
 
         if anthropic_request.stream:
+            request_id = request_id_var.get("-")
             return StreamingResponse(
-                stream_anthropic_response(anthropic_request, session_id),
+                _bind_request_id(stream_anthropic_response(anthropic_request, session_id), request_id),
                 media_type="text/event-stream"
             )
         else:
