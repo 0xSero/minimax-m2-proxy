@@ -52,6 +52,25 @@ def _dump_for_log(value: Any) -> str:
         return str(value)
 
 
+def _flatten_anthropic_system(system_content: Any) -> str:
+    if isinstance(system_content, str):
+        return system_content
+    if isinstance(system_content, list):
+        parts: List[str] = []
+        for entry in system_content:
+            if isinstance(entry, dict):
+                if entry.get("type") == "text" and "text" in entry:
+                    parts.append(str(entry["text"]))
+                elif "text" in entry:
+                    parts.append(str(entry["text"]))
+            elif isinstance(entry, str):
+                parts.append(entry)
+        if parts:
+            return "\n\n".join(part for part in parts if part)
+        return _dump_for_log(system_content)
+    return str(system_content)
+
+
 if settings.enable_streaming_debug:
     stream_logger.setLevel(logging.DEBUG)
     if settings.streaming_debug_path:
@@ -836,7 +855,7 @@ async def complete_anthropic_response(anthropic_request: AnthropicChatRequest, s
 
     # Add system message if present
     if anthropic_request.system:
-        system_content = anthropic_request.system if isinstance(anthropic_request.system, str) else str(anthropic_request.system)
+        system_content = _flatten_anthropic_system(anthropic_request.system)
         openai_messages.insert(0, {"role": "system", "content": system_content})
 
     # Check if this is a MiniMax model that needs XML parsing
@@ -918,6 +937,10 @@ async def complete_anthropic_response(anthropic_request: AnthropicChatRequest, s
     # Convert tools
     tools = anthropic_tools_to_openai(anthropic_request.tools)
     tool_choice = anthropic_tool_choice_to_openai(anthropic_request.tool_choice)
+    if stream_logger.isEnabledFor(logging.DEBUG):
+        stream_logger.debug("anthropic_tools_raw: %s", _dump_for_log(anthropic_request.tools))
+    if stream_logger.isEnabledFor(logging.DEBUG):
+        stream_logger.debug("anthropic_tools_raw: %s", _dump_for_log(anthropic_request.tools))
 
     # Debug logging
     logger.debug(f"Converted {len(openai_messages)} messages to OpenAI format:")
@@ -1063,7 +1086,7 @@ async def stream_anthropic_response(anthropic_request: AnthropicChatRequest, ses
 
     # Add system message if present
     if anthropic_request.system:
-        system_content = anthropic_request.system if isinstance(anthropic_request.system, str) else str(anthropic_request.system)
+        system_content = _flatten_anthropic_system(anthropic_request.system)
         openai_messages.insert(0, {"role": "system", "content": system_content})
 
     # Check if this is a MiniMax model that needs XML parsing
