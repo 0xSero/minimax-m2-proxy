@@ -4,7 +4,8 @@ import json
 
 import pytest
 
-from proxy.main import OpenAIChatRequest, OpenAIMessage, stream_openai_response
+from proxy.main import OpenAIChatRequest, stream_openai_response
+from proxy.models import OpenAIMessage
 
 
 def decode_sse_chunk(chunk: str) -> dict:

@@ -4,7 +4,8 @@ import json
 
 import pytest
 
-from proxy.main import OpenAIChatRequest, OpenAIMessage, complete_openai_response
+from proxy.main import OpenAIChatRequest, complete_openai_response
+from proxy.models import OpenAIMessage
 
 
 @pytest.mark.asyncio
