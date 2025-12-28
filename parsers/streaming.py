@@ -1,9 +1,12 @@
 """Simple streaming parser for MiniMax-M2 responses."""
 
+import logging
 from typing import Any, Dict, List, Optional
 
 from .reasoning import split_think
 from .tools import parse_tool_calls
+
+stream_logger = logging.getLogger("minimax.streaming")
 
 
 class StreamingParser:
@@ -27,6 +30,11 @@ class StreamingParser:
     def has_tool_calls(self) -> bool:
         """Check if tool calls were detected."""
         return self.tools_sent
+
+    @staticmethod
+    def _log_emit(payload: Dict[str, Any]) -> None:
+        if stream_logger.isEnabledFor(logging.DEBUG):
+            stream_logger.debug("parser_emit: %s", payload)
 
     def _compute_reasoning_delta(self) -> str:
         """Return incremental reasoning text (inside <think>...</think>)."""
@@ -60,6 +68,9 @@ class StreamingParser:
             - reasoning_delta: Reasoning text delta
             - tool_calls: Parsed tool call payload when available
         """
+        if stream_logger.isEnabledFor(logging.DEBUG):
+            stream_logger.debug("parser_chunk: %s", chunk)
+
         self.buffer += chunk
         reasoning_delta = self._compute_reasoning_delta()
 
@@ -74,7 +85,9 @@ class StreamingParser:
             else:
                 # Still waiting for confirmation; only emit reasoning if available
                 if reasoning_delta:
-                    return {"type": "reasoning", "reasoning_delta": reasoning_delta}
+                    payload = {"type": "reasoning", "reasoning_delta": reasoning_delta}
+                    self._log_emit(payload)
+                    return payload
                 return None
 
         has_start = "<minimax:tool_call>" in self.buffer
@@ -100,9 +113,14 @@ class StreamingParser:
                     aggregate_reasoning = reasoning_delta or think_text
                     if aggregate_reasoning:
                         result["reasoning_delta"] = aggregate_reasoning
+                    self._log_emit(result)
                     return result
 
-            return {"type": "reasoning", "reasoning_delta": reasoning_delta} if reasoning_delta else None
+            if reasoning_delta:
+                payload = {"type": "reasoning", "reasoning_delta": reasoning_delta}
+                self._log_emit(payload)
+                return payload
+            return None
 
         if has_start and has_end and not self.tools_sent:
             result = parse_tool_calls(self.buffer, self.tools)
@@ -129,6 +147,7 @@ class StreamingParser:
                     aggregate_reasoning = reasoning_delta or think_text
                     if aggregate_reasoning:
                         response["reasoning_delta"] = aggregate_reasoning
+                    self._log_emit(response)
                     return response
 
                 tool_end_idx = self.buffer.find("</minimax:tool_call>")
@@ -147,6 +166,7 @@ class StreamingParser:
                     payload["raw_delta"] = tool_delta
                 if reasoning_delta:
                     payload["reasoning_delta"] = reasoning_delta
+                self._log_emit(payload)
                 return payload
 
         if len(self.buffer) > self.sent_position:
@@ -167,9 +187,14 @@ class StreamingParser:
             if aggregate_reasoning:
                 result["reasoning_delta"] = aggregate_reasoning
 
+            self._log_emit(result)
             return result
 
-        return {"type": "reasoning", "reasoning_delta": reasoning_delta} if reasoning_delta else None
+        if reasoning_delta:
+            payload = {"type": "reasoning", "reasoning_delta": reasoning_delta}
+            self._log_emit(payload)
+            return payload
+        return None
 
     def flush_pending(self) -> Optional[Dict[str, Any]]:
         """Flush any remaining buffered content at stream end."""
@@ -183,6 +208,8 @@ class StreamingParser:
             }
             if think_text:
                 result["reasoning_delta"] = think_text
+            if stream_logger.isEnabledFor(logging.DEBUG):
+                stream_logger.debug("parser_flush: %s", result)
             return result
         return None
 

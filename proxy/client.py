@@ -1,8 +1,12 @@
 """TabbyAPI client for backend communication"""
 
-import httpx
 import json
-from typing import Dict, Any, AsyncIterator, List
+import logging
+from typing import Any, AsyncIterator, Dict, List
+
+import httpx
+
+stream_logger = logging.getLogger("minimax.streaming")
 
 
 class TabbyClient:
@@ -102,6 +106,8 @@ class TabbyClient:
             response.raise_for_status()
 
             async for line in response.aiter_lines():
+                if stream_logger.isEnabledFor(logging.DEBUG):
+                    stream_logger.debug("tabby_sse: %s", line)
                 if line.startswith("data: "):
                     yield line
 
@@ -125,10 +131,16 @@ class TabbyClient:
 
                 try:
                     chunk = json.loads(data_str)
-                    if "choices" in chunk and len(chunk["choices"]) > 0:
-                        yield chunk
                 except json.JSONDecodeError:
+                    if stream_logger.isEnabledFor(logging.DEBUG):
+                        stream_logger.debug("tabby_chunk_decode_error: %s", data_str)
                     continue
+
+                if stream_logger.isEnabledFor(logging.DEBUG):
+                    stream_logger.debug("tabby_chunk: %s", chunk)
+
+                if "choices" in chunk and len(chunk["choices"]) > 0:
+                    yield chunk
 
     async def health_check(self) -> bool:
         """Check if TabbyAPI is healthy"""

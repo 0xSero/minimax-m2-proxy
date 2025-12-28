@@ -5,9 +5,12 @@ https://platform.minimax.io/docs/guides/text-m2-function-call
 """
 
 import json
+import logging
 import re
 import uuid
 from typing import Any, Dict, List, Optional
+
+logger = logging.getLogger("minimax.tooling")
 
 
 def _format_param_value_for_xml(value: Any) -> str:
@@ -116,8 +119,13 @@ def parse_tool_calls(model_output: str, tools: Optional[List[Dict]] = None) -> D
             "content": str  # Content without tool call blocks
         }
     """
+    if logger.isEnabledFor(logging.DEBUG):
+        logger.debug("parse_tool_calls: input_len=%s", len(model_output))
+
     # Quick check if tool call marker is present
     if "<minimax:tool_call>" not in model_output:
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug("parse_tool_calls: no tool call marker")
         return {
             "tools_called": False,
             "tool_calls": [],
@@ -177,17 +185,24 @@ def parse_tool_calls(model_output: str, tools: Optional[List[Dict]] = None) -> D
                         param_dict[param_name] = convert_param_value(param_value, param_type)
 
                 # Build OpenAI-format tool call
-                tool_calls.append({
+                tool_call_payload = {
                     "id": f"call_{uuid.uuid4().hex[:24]}",
                     "type": "function",
                     "function": {
                         "name": function_name,
                         "arguments": json.dumps(param_dict, ensure_ascii=False)
                     }
-                })
+                }
+                tool_calls.append(tool_call_payload)
+                if logger.isEnabledFor(logging.DEBUG):
+                    logger.debug(
+                        "parse_tool_calls: tool=%s args=%s",
+                        function_name,
+                        param_dict,
+                    )
 
     except Exception as e:
-        print(f"Failed to parse tool calls: {e}")
+        logger.exception("Failed to parse tool calls: %s", e)
         return {
             "tools_called": False,
             "tool_calls": [],
@@ -195,6 +210,8 @@ def parse_tool_calls(model_output: str, tools: Optional[List[Dict]] = None) -> D
         }
 
     if not tool_calls:
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug("parse_tool_calls: marker found but no tool calls parsed")
         return {
             "tools_called": False,
             "tool_calls": [],
@@ -205,8 +222,15 @@ def parse_tool_calls(model_output: str, tools: Optional[List[Dict]] = None) -> D
     content_regex = re.compile(r"<minimax:tool_call>.*?</minimax:tool_call>", re.DOTALL)
     content = content_regex.sub('', model_output).strip()
 
-    return {
+    result = {
         "tools_called": True,
         "tool_calls": tool_calls,
         "content": content if content else None
     }
+    if logger.isEnabledFor(logging.DEBUG):
+        logger.debug(
+            "parse_tool_calls: parsed=%s content_len=%s",
+            len(tool_calls),
+            len(result["content"]) if result["content"] else 0,
+        )
+    return result

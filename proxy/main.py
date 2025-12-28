@@ -506,11 +506,15 @@ async def stream_openai_response(chat_request: OpenAIChatRequest, session_id: Op
                 raw_segments.append(addition)
                 reasoning_segments.append(reasoning_delta)
                 if reasoning_split:
+                    if stream_logger.isEnabledFor(logging.DEBUG):
+                        stream_logger.debug("emit_reasoning: %s", reasoning_delta)
                     yield openai_formatter.format_streaming_chunk(
                         reasoning_delta=reasoning_delta,
                         model=chat_request.model,
                     )
                 else:
+                    if stream_logger.isEnabledFor(logging.DEBUG):
+                        stream_logger.debug("emit_content: %s", addition)
                     yield openai_formatter.format_streaming_chunk(
                         delta=addition,
                         model=chat_request.model,
@@ -531,6 +535,8 @@ async def stream_openai_response(chat_request: OpenAIChatRequest, session_id: Op
             if content_delta:
                 raw_segments.append(content_delta)
                 if content_delta:
+                    if stream_logger.isEnabledFor(logging.DEBUG):
+                        stream_logger.debug("emit_content: %s", content_delta)
                     yield openai_formatter.format_streaming_chunk(
                         delta=content_delta,
                         model=chat_request.model,
@@ -538,6 +544,8 @@ async def stream_openai_response(chat_request: OpenAIChatRequest, session_id: Op
 
             if tool_delta:
                 merge_tool_call_delta(tool_delta)
+                if stream_logger.isEnabledFor(logging.DEBUG):
+                    stream_logger.debug("emit_tool_calls: %s", tool_delta)
                 yield openai_formatter.format_streaming_chunk(
                     tool_calls=tool_delta,
                     model=chat_request.model,
@@ -571,6 +579,13 @@ async def stream_openai_response(chat_request: OpenAIChatRequest, session_id: Op
                 if final_finish_reason == "stop" and final_tool_calls:
                     final_finish_reason = "tool_calls"
 
+                if stream_logger.isEnabledFor(logging.DEBUG):
+                    stream_logger.debug(
+                        "stream_finish: reason=%s tool_calls=%s raw_len=%s",
+                        final_finish_reason,
+                        len(final_tool_calls) if final_tool_calls else 0,
+                        len(final_raw_content),
+                    )
                 yield openai_formatter.format_streaming_chunk(
                     finish_reason=final_finish_reason,
                     model=chat_request.model,
@@ -643,6 +658,13 @@ async def stream_openai_response(chat_request: OpenAIChatRequest, session_id: Op
                             for tool_chunk in openai_formatter.format_tool_call_stream(
                                 tool_call, idx, model=chat_request.model
                             ):
+                                if stream_logger.isEnabledFor(logging.DEBUG):
+                                    stream_logger.debug(
+                                        "emit_tool_call_stream: index=%s id=%s name=%s",
+                                        idx,
+                                        tool_call.get("id"),
+                                        tool_call.get("function", {}).get("name"),
+                                    )
                                 yield tool_chunk
 
                     elif parsed["type"] == "reasoning" and reasoning_split and reasoning_delta:
@@ -672,6 +694,8 @@ async def stream_openai_response(chat_request: OpenAIChatRequest, session_id: Op
                         )
                 if finish_reason == "stop" and streaming_parser.has_tool_calls():
                     finish_reason = "tool_calls"
+                if stream_logger.isEnabledFor(logging.DEBUG):
+                    stream_logger.debug("stream_finish: reason=%s", finish_reason)
                 yield openai_formatter.format_streaming_chunk(
                     finish_reason=finish_reason,
                     model=chat_request.model,
@@ -727,6 +751,12 @@ async def stream_openai_response(chat_request: OpenAIChatRequest, session_id: Op
 
         first_delta = first_chunk.get("choices", [{}])[0].get("delta", {})
         structured_mode = bool(first_delta.get("reasoning_content"))
+        if stream_logger.isEnabledFor(logging.DEBUG):
+            stream_logger.debug(
+                "openai_stream_mode: structured=%s first_delta=%s",
+                structured_mode,
+                first_delta,
+            )
 
         chunk_iter = prepend_chunk(first_chunk, stream_gen)
 
@@ -1176,6 +1206,8 @@ async def stream_anthropic_response(anthropic_request: AnthropicChatRequest, ses
     try:
         # Send message_start
         yield anthropic_formatter.format_message_start(anthropic_request.model)
+        if stream_logger.isEnabledFor(logging.DEBUG):
+            stream_logger.debug("anthropic_stream_start: model=%s", anthropic_request.model)
 
         # Start first content block
         content_block_index = 0
@@ -1214,6 +1246,8 @@ async def stream_anthropic_response(anthropic_request: AnthropicChatRequest, ses
                         reasoning_delta,
                         delta_type="thinking_delta",
                     )
+                    if stream_logger.isEnabledFor(logging.DEBUG):
+                        stream_logger.debug("emit_thinking: %s", reasoning_delta)
 
                 if content_delta:
                     # Close thinking block if we're starting content
@@ -1234,10 +1268,14 @@ async def stream_anthropic_response(anthropic_request: AnthropicChatRequest, ses
                         delta_type="text_delta"
                     )
                     text_emitted = True
+                    if stream_logger.isEnabledFor(logging.DEBUG):
+                        stream_logger.debug("emit_text: %s", content_delta)
 
                 # Handle tool calls
                 if tool_calls_delta:
                     logger.debug(f"Received tool_calls_delta: {tool_calls_delta}")
+                    if stream_logger.isEnabledFor(logging.DEBUG):
+                        stream_logger.debug("anthropic_tool_delta: %s", tool_calls_delta)
 
                     # Close any open blocks
                     if content_block_started:
@@ -1344,6 +1382,8 @@ async def stream_anthropic_response(anthropic_request: AnthropicChatRequest, ses
                             tool_call = captured_tool_calls[idx]
                             # Debug logging
                             logger.info(f"Emitting tool call: {tool_call['function']['name']}, args: {tool_call['function']['arguments'][:100] if tool_call['function']['arguments'] else 'EMPTY'}")
+                            if stream_logger.isEnabledFor(logging.DEBUG):
+                                stream_logger.debug("emit_tool_use: %s", tool_call)
 
                             # Send tool_use start with empty input
                             yield anthropic_formatter.format_tool_use_start(
@@ -1373,6 +1413,8 @@ async def stream_anthropic_response(anthropic_request: AnthropicChatRequest, ses
                         stop_reason = "tool_use"
 
                     yield anthropic_formatter.format_message_delta(stop_reason)
+                    if stream_logger.isEnabledFor(logging.DEBUG):
+                        stream_logger.debug("stream_finish: reason=%s", stop_reason)
 
         # Send message_stop
         if thinking_block_started:
