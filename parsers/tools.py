@@ -12,12 +12,12 @@ from typing import Any, Dict, List, Optional
 
 def _format_param_value_for_xml(value: Any) -> str:
     """Convert a parameter value to string for XML embedding."""
-    if isinstance(value, (dict, list)):
-        try:
-            return json.dumps(value, ensure_ascii=False)
-        except (TypeError, ValueError):
-            return str(value)
-    return str(value)
+    if isinstance(value, str):
+        return value
+    try:
+        return json.dumps(value, ensure_ascii=False)
+    except (TypeError, ValueError):
+        return str(value)
 
 
 def tool_calls_to_minimax_xml(tool_calls: Optional[List[Dict[str, Any]]]) -> Optional[str]:

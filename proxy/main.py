@@ -133,6 +133,7 @@ def normalize_openai_history(messages: List[Dict[str, Any]]) -> List[Dict[str, A
                             msg_copy["content"] = xml_block
                     else:
                         msg_copy["content"] = updated_content
+                msg_copy.pop("tool_calls", None)
 
         normalized.append(msg_copy)
     return normalized

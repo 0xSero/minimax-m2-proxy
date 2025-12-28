@@ -101,4 +101,6 @@ def test_anthropic_messages_to_openai_flattens_tool_result_blocks() -> None:
     )
 
     converted = anthropic_messages_to_openai([message])
-    assert converted[0]["content"] == 'Tool result for call_123: {"temp": "24C"}'
+    assert converted[0]["role"] == "tool"
+    assert converted[0]["tool_call_id"] == "call_123"
+    assert converted[0]["content"] == '{"temp": "24C"}'

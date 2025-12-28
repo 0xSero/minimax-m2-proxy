@@ -205,8 +205,7 @@ def _stringify_tool_result_content(content: Optional[Union[str, List[Dict[str, A
 def anthropic_messages_to_openai(messages: List[AnthropicMessage]) -> List[Dict[str, Any]]:
     """Convert Anthropic messages to OpenAI format
 
-    CRITICAL: MiniMax-M2 chat template does NOT support role="tool".
-    Tool results must be sent as role="user" messages as per MiniMax docs.
+    MiniMax-M2 chat template expects tool results as role="tool" messages.
     """
     openai_messages = []
 
@@ -217,11 +216,13 @@ def anthropic_messages_to_openai(messages: List[AnthropicMessage]) -> List[Dict[
                 "role": msg.role,
                 "content": msg.content
             })
-        else:
-            # Content blocks - merge text and thinking blocks in order
+            continue
+
+        # Content blocks - merge text and thinking blocks in order
+        if msg.role == "assistant":
             text_segments: List[str] = []
-            tool_calls = []
-            tool_results = []
+            tool_calls: List[Dict[str, Any]] = []
+            tool_results: List[AnthropicContentBlock] = []
 
             for block in msg.content:
                 if block.type == "thinking" and block.thinking:
@@ -240,13 +241,9 @@ def anthropic_messages_to_openai(messages: List[AnthropicMessage]) -> List[Dict[
                         }
                     })
                 elif block.type == "tool_result":
-                    # Collect tool results - will be formatted as user message content
-                    tool_results.append({
-                        "tool_use_id": block.tool_use_id,
-                        "content": _stringify_tool_result_content(block.content)
-                    })
+                    tool_results.append(block)
 
-            # Build message
+            # Build assistant message
             has_text = any(segment for segment in text_segments)
             if has_text or tool_calls:
                 message = {
@@ -257,13 +254,43 @@ def anthropic_messages_to_openai(messages: List[AnthropicMessage]) -> List[Dict[
                     message["tool_calls"] = tool_calls
                 openai_messages.append(message)
 
-            # Tool results become user messages (NOT role="tool")
-            # This matches MiniMax's expected format
-            if tool_results:
-                for result in tool_results:
-                    openai_messages.append({
-                        "role": "user",
-                        "content": f"Tool result for {result['tool_use_id']}: {result['content']}"
-                    })
+            # Emit tool results if they appear (unexpected for assistant role)
+            for result in tool_results:
+                openai_messages.append({
+                    "role": "tool",
+                    "tool_call_id": result.tool_use_id,
+                    "content": _stringify_tool_result_content(result.content),
+                })
+            continue
+
+        # User (or other) role: preserve ordering of text vs tool results
+        text_segments: List[str] = []
+
+        def flush_text() -> None:
+            if not text_segments:
+                return
+            openai_messages.append({
+                "role": msg.role,
+                "content": "\n".join(segment for segment in text_segments if segment)
+            })
+            text_segments.clear()
+
+        for block in msg.content:
+            if block.type == "tool_result":
+                flush_text()
+                openai_messages.append({
+                    "role": "tool",
+                    "tool_call_id": block.tool_use_id,
+                    "content": _stringify_tool_result_content(block.content),
+                })
+                continue
+            if block.type == "thinking" and block.thinking:
+                text_segments.append(f"<think>{block.thinking}</think>")
+            elif block.type == "text" and block.text:
+                text_segments.append(block.text)
+            elif block.type == "image":
+                text_segments.append("[image]")
+
+        flush_text()
 
     return openai_messages
