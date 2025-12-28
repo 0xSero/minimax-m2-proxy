@@ -45,6 +45,13 @@ def is_minimax_model(model_name: str) -> bool:
     return any(pattern.lower() in model_lower for pattern in settings.minimax_model_patterns)
 
 
+def _dump_for_log(value: Any) -> str:
+    try:
+        return json.dumps(value, ensure_ascii=False, default=str)
+    except (TypeError, ValueError):
+        return str(value)
+
+
 if settings.enable_streaming_debug:
     stream_logger.setLevel(logging.DEBUG)
     if settings.streaming_debug_path:
@@ -426,6 +433,11 @@ async def stream_openai_response(chat_request: OpenAIChatRequest, session_id: Op
         settings.enable_reasoning_split
         and bool(chat_request.extra_body and chat_request.extra_body.get("reasoning_split"))
     )
+
+    if stream_logger.isEnabledFor(logging.DEBUG):
+        stream_logger.debug("openai_messages: %s", _dump_for_log(normalized_messages))
+        stream_logger.debug("openai_tools: %s", _dump_for_log(tools))
+        stream_logger.debug("openai_tool_choice: %s", _dump_for_log(chat_request.tool_choice))
 
     final_raw_content = ""
     final_reasoning_text = ""
@@ -908,10 +920,17 @@ async def complete_anthropic_response(anthropic_request: AnthropicChatRequest, s
     tool_choice = anthropic_tool_choice_to_openai(anthropic_request.tool_choice)
 
     # Debug logging
-    import pprint
     logger.debug(f"Converted {len(openai_messages)} messages to OpenAI format:")
     for i, msg in enumerate(openai_messages):
-        logger.debug(f"  Message {i}: role={msg.get('role')}, content_len={len(str(msg.get('content', '')))}, has_tool_calls={bool(msg.get('tool_calls'))}")
+        logger.debug(
+            "  Message %s: role=%s, content_len=%s, has_tool_calls=%s",
+            i,
+            msg.get("role"),
+            len(str(msg.get("content", ""))),
+            bool(msg.get("tool_calls")),
+        )
+    if stream_logger.isEnabledFor(logging.DEBUG):
+        stream_logger.debug("anthropic_messages: %s", _dump_for_log(openai_messages))
 
     # Configure thinking tokens - always send for MiniMax to unlock full generation
     if anthropic_request.thinking:
@@ -1176,12 +1195,6 @@ async def stream_anthropic_response(anthropic_request: AnthropicChatRequest, ses
     openai_messages = repair_result.messages
     normalized_messages = normalize_openai_history(openai_messages)
 
-    # Debug: Log message structure
-    logger.info(f"Sending {len(normalized_messages)} messages to TabbyAPI")
-    for i, msg in enumerate(normalized_messages):
-        msg_preview = str(msg)[:200] if len(str(msg)) > 200 else str(msg)
-        logger.debug(f"  Message {i}: {msg_preview}...")
-
     # Convert tools
     tools = anthropic_tools_to_openai(anthropic_request.tools)
     tool_choice = anthropic_tool_choice_to_openai(anthropic_request.tool_choice)
@@ -1202,6 +1215,19 @@ async def stream_anthropic_response(anthropic_request: AnthropicChatRequest, ses
         thinking_payload = {"max_thinking_tokens": effective_max_tokens // 2}
     else:
         thinking_payload = None
+
+    # Debug: Log full payload when streaming debug is enabled
+    logger.info(f"Sending {len(normalized_messages)} messages to TabbyAPI")
+    if stream_logger.isEnabledFor(logging.DEBUG):
+        for i, msg in enumerate(normalized_messages):
+            stream_logger.debug("tabby_message[%s]: %s", i, _dump_for_log(msg))
+        stream_logger.debug("tabby_tools: %s", _dump_for_log(tools))
+        stream_logger.debug("tabby_tool_choice: %s", _dump_for_log(tool_choice))
+        stream_logger.debug("tabby_thinking: %s", _dump_for_log(thinking_payload))
+    else:
+        for i, msg in enumerate(normalized_messages):
+            msg_preview = str(msg)[:200] if len(str(msg)) > 200 else str(msg)
+            logger.debug(f"  Message {i}: {msg_preview}...")
 
     try:
         # Send message_start
