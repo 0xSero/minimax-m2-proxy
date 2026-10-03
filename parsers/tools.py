@@ -82,7 +82,10 @@ def convert_param_value(value: str, param_type: str) -> Any:
             return value
     elif param_type in ["number", "float"]:
         try:
-            val = float(value)
+            text = value.strip()
+            if re.fullmatch(r"[+-]?\d+(?:\.0+)?", text):
+                return int(text.split(".", 1)[0])
+            val = float(text)
             return val if val != int(val) else int(val)
         except (ValueError, TypeError):
             return value
